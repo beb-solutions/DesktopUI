@@ -237,7 +237,7 @@ fn compute_rows(
         let status = if is_connecting {
             "(connecting...)".into()
         } else {
-            "(not joined)".into()
+            "(not connected)".into()
         };
         rows.push(Row {
             id: id.clone(),
@@ -248,8 +248,15 @@ fn compute_rows(
         });
     }
 
-    if sort_by_name {
-        rows.sort_by(|a, b| {
+    // Currently connected networks always come first; within each group the
+    // rows are ordered by the selected sort key (name by default, or ID).
+    rows.sort_by(|a, b| {
+        match (a.joined, b.joined) {
+            (true, false) => return Ordering::Less,
+            (false, true) => return Ordering::Greater,
+            _ => {}
+        }
+        if sort_by_name {
             let an = &a.name;
             let bn = &b.name;
             match (an.is_empty(), bn.is_empty()) {
@@ -258,10 +265,10 @@ fn compute_rows(
                 (false, true) => Ordering::Less,
                 (false, false) => an.cmp(bn).then_with(|| a.id.cmp(&b.id)),
             }
-        });
-    } else {
-        rows.sort_by(|a, b| a.id.cmp(&b.id));
-    }
+        } else {
+            a.id.cmp(&b.id)
+        }
+    });
     rows
 }
 
@@ -446,8 +453,12 @@ unsafe extern "C" fn area_draw(
         let row = &state.rows[i];
         let y = i as f64 * ROW_H;
 
-        // Alternate row shading.
-        if i % 2 == 0 {
+        // Currently connected networks get a light green background so they
+        // clearly stand out from the "(not connected)" entries, which keep
+        // the alternate row shading.
+        if row.joined {
+            fill_rect(ctx, 0.0, y, state.content_w, ROW_H, 0.88, 0.97, 0.89, 1.0);
+        } else if i % 2 == 0 {
             fill_rect(ctx, 0.0, y, state.content_w, ROW_H, 0.95, 0.95, 0.95, 1.0);
         }
 
@@ -766,7 +777,7 @@ pub fn networks_main() {
         let by_name = CString::new("Sort by Name").unwrap();
         libui::uiComboboxAppend(sort_combo, by_id.as_ptr());
         libui::uiComboboxAppend(sort_combo, by_name.as_ptr());
-        libui::uiComboboxSetSelected(sort_combo, 0);
+        libui::uiComboboxSetSelected(sort_combo, 1); // default: sort by name
         libui::uiBoxAppend(sort_row, sort_combo.cast(), 0);
         libui::uiBoxAppend(vbox, sort_row.cast(), 0);
 
@@ -805,7 +816,7 @@ pub fn networks_main() {
             client,
             dirty_flag,
             search: String::new(),
-            sort_by_name: false,
+            sort_by_name: true,
             area,
             rows: Vec::new(),
             content_w,
