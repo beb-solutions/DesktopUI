@@ -25,6 +25,7 @@ dirs = "6.0.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = "^1"
+objc = "0.2"
 mac-notification-sys = { git = "https://github.com/h4llow3En/mac-notification-sys", rev = "65573f44bd5a3e4710b90617eb9056826a04e9c0" }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]

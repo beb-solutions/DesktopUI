@@ -34,6 +34,7 @@ use crate::tray::*;
 pub mod about;
 pub mod join;
 pub mod libui;
+pub mod networks;
 pub mod serviceclient;
 pub mod tray;
 
@@ -532,6 +533,17 @@ fn tray_main() {
                             }
                         });
                     }
+                })),
+            });
+
+            menu.push(TrayMenuItem::Text {
+                text: "Show Networks...".into(),
+                checked: false,
+                disabled: false,
+                handler: Some(Box::new(|| {
+                    let _ = Command::new(std::env::current_exe().unwrap())
+                        .arg("networks")
+                        .spawn();
                 })),
             });
 
@@ -1201,6 +1213,7 @@ fn main() {
                 about::about_main(version)
             }
             "join_prompt" => join::join_main(),
+            "networks" => networks::networks_main(),
             "copy_authtoken" => {
                 // invoked with elevated permissions to get the auth token and copy it locally
                 if args.len() < 3 {
