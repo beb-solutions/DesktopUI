@@ -47,6 +47,19 @@ struct Row {
     joined: bool,
 }
 
+/// A per-row action that could not be run inline (because the service client
+/// was busy) and is applied from the timer tick instead.
+enum RowAction {
+    /// Leave the service and keep the network remembered so it can be
+    /// reconnected later. This is what the tray calls "Disconnect".
+    Disconnect {
+        id: String,
+        name: String,
+        settings: String,
+    },
+    Reconnect { id: String, settings: String },
+}
+
 struct State {
     client: Arc<Mutex<ServiceClient>>,
     dirty_flag: Arc<AtomicBool>,
@@ -56,6 +69,8 @@ struct State {
     rows: Vec<Row>,
     content_w: f64,
     content_h: i32,
+    pending: Vec<RowAction>,
+    rebuild_needed: bool,
 }
 
 static mut G_STATE: *mut State = null_mut();
@@ -144,11 +159,9 @@ fn load_geometry() -> Option<(f64, f64, c_int, c_int)> {
     }
 }
 
-fn compute_rows(client: &Mutex<ServiceClient>, search: &str, sort_by_name: bool) -> Vec<Row> {
-    let guard = client.lock();
-    let networks = guard.networks();
-    let saved = guard.saved_networks();
-    drop(guard);
+fn compute_rows(client: &ServiceClient, search: &str, sort_by_name: bool) -> Vec<Row> {
+    let networks = client.networks();
+    let saved = client.saved_networks();
 
     let query = search.trim().to_lowercase();
     let mut rows: Vec<Row> = Vec::new();
@@ -421,7 +434,7 @@ unsafe extern "C" fn area_draw(
 
         // Action buttons (right-aligned text, one cell each).
         let actions: [&str; 2] = if row.joined {
-            ["Copy", "Leave"]
+            ["Copy", "Disconnect"]
         } else {
             ["Copy", "Reconnect"]
         };
@@ -472,27 +485,29 @@ unsafe extern "C" fn area_mouse(
     };
 
     let row = state.rows[idx].clone();
-    let is_joined = row.joined;
 
-    // col 0 is always "Copy"; col 1 is Leave/Reconnect.
-    let client = row_action_client();
+    // col 0 is always "Copy"; col 1 is Disconnect/Reconnect. Row actions are
+    // queued and applied from the timer tick so this handler never blocks the
+    // UI thread on the service client lock (the background sync thread may
+    // hold it for a while). No notifications are shown from this window: the
+    // row list itself provides the feedback.
     if col == 0 {
         crate::copy_to_clipboard(row.id.as_str());
-        crate::notify("Copied network ID to clipboard.", None);
-    } else if is_joined {
-        let mut c = client.lock();
-        c.enqueue_delete(format!("network/{}", row.id));
-        c.remember_network(row.id.clone(), row.name.clone(), row.settings.clone());
-        crate::notify("Network left. It can be rejoined from the tray menu.", None);
-    } else {
-        let mut c = client.lock();
-        c.enqueue_post(format!("network/{}", row.id), row.settings.clone());
-        crate::notify("Reconnecting to network...", None);
+        return;
     }
-}
-
-fn row_action_client() -> Arc<Mutex<ServiceClient>> {
-    unsafe { (&*G_STATE).client.clone() }
+    if row.joined {
+        state.pending.push(RowAction::Disconnect {
+            id: row.id,
+            name: row.name,
+            settings: row.settings,
+        });
+    } else {
+        state.pending.push(RowAction::Reconnect {
+            id: row.id,
+            settings: row.settings,
+        });
+    }
+    state.rebuild_needed = true;
 }
 
 unsafe extern "C" fn area_mouse_crossed(
@@ -512,9 +527,21 @@ unsafe extern "C" fn area_key(
     0
 }
 
-fn rebuild(state: &mut State) {
-    state.rows = compute_rows(&state.client, &state.search, state.sort_by_name);
+/// Recompute the row list and repaint, but only if the service client lock is
+/// free right now. Returns false when the background sync thread is holding
+/// the lock; callers keep the rebuild flag set and retry on the next timer
+/// tick. This keeps the UI thread responsive even while a (slow) service sync
+/// is running.
+fn try_rebuild(state: &mut State) -> bool {
+    let Some(guard) = state.client.try_lock() else {
+        return false;
+    };
+    let rows = compute_rows(&guard, &state.search, state.sort_by_name);
+    drop(guard);
+    state.rows = rows;
+    state.rebuild_needed = false;
     update_area(state);
+    true
 }
 
 unsafe extern "C" fn on_search_changed(e: *mut libui::uiEntry, data: *mut c_void) {
@@ -525,19 +552,50 @@ unsafe extern "C" fn on_search_changed(e: *mut libui::uiEntry, data: *mut c_void
     } else {
         CStr::from_ptr(text.cast()).to_string_lossy().to_string()
     };
-    rebuild(state);
+    state.rebuild_needed = true;
 }
 
 unsafe extern "C" fn on_sort_changed(c: *mut libui::uiCombobox, data: *mut c_void) {
     let state = &mut *(data as *mut State);
     state.sort_by_name = libui::uiComboboxSelected(c) == 1;
-    rebuild(state);
+    state.rebuild_needed = true;
 }
 
 unsafe extern "C" fn on_timer(data: *mut c_void) -> c_int {
     let state = &mut *(data as *mut State);
-    if state.dirty_flag.swap(false, AtomicOrdering::Relaxed) {
-        rebuild(state);
+
+    // Apply queued row actions as soon as the service client lock is free.
+    if !state.pending.is_empty() {
+        if let Some(mut guard) = state.client.try_lock() {
+            let actions = std::mem::take(&mut state.pending);
+            for action in actions {
+                match action {
+                    RowAction::Disconnect {
+                        id,
+                        name,
+                        settings,
+                    } => {
+                        guard.enqueue_delete(format!("network/{}", id));
+                        guard.remember_network(id, name, settings);
+                    }
+                    RowAction::Reconnect { id, settings } => {
+                        guard.enqueue_post(format!("network/{}", id), settings);
+                    }
+                }
+            }
+            drop(guard);
+            state.rebuild_needed = true;
+        }
+    }
+
+    // Repaint whenever new data arrived or a queued action/control change
+    // needs it, without ever blocking the UI thread on the client lock.
+    if state.rebuild_needed || state.dirty_flag.load(AtomicOrdering::Relaxed) {
+        if try_rebuild(state) {
+            state.dirty_flag.store(false, AtomicOrdering::Relaxed);
+        } else {
+            state.rebuild_needed = true;
+        }
     }
     1
 }
@@ -625,7 +683,7 @@ pub fn networks_main() {
         libui::uiBoxAppend(sort_row, sort_combo.cast(), 0);
         libui::uiBoxAppend(vbox, sort_row.cast(), 0);
 
-        let (client, dirty_flag) = crate::start_client(vec!["status", "network"], 250, 4);
+        let (client, dirty_flag) = crate::start_client_async(vec!["status", "network"], 250, 4);
 
         // Initialize drawing handler before creating the area. The handler is
         // leaked (Box::into_raw) so its address stays valid for the app lifetime.
@@ -665,6 +723,8 @@ pub fn networks_main() {
             rows: Vec::new(),
             content_w,
             content_h: 60,
+            pending: Vec::new(),
+            rebuild_needed: true,
         });
         let state_ptr = Box::into_raw(state);
         G_STATE = state_ptr;
@@ -675,7 +735,12 @@ pub fn networks_main() {
         libui::uiWindowOnContentSizeChanged(main_window, Some(on_content_size_changed), state_ptr.cast());
         libui::uiTimer(250, Some(on_timer), state_ptr.cast());
 
-        rebuild(&mut *state_ptr);
+        // Populate whatever is already available without blocking the UI
+        // thread; if the client is busy the timer keeps retrying until the
+        // first background sync lands.
+        if !try_rebuild(&mut *state_ptr) {
+            (*state_ptr).rebuild_needed = true;
+        }
 
         libui::uiControlShow(main_window.cast());
         libui::uiMain();

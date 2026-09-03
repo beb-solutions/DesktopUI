@@ -400,14 +400,44 @@ fn start_client(
     tick_period_ms: u64,
     refresh_period_ticks: u64,
 ) -> (Arc<Mutex<ServiceClient>>, Arc<AtomicBool>) {
+    start_client_impl(refresh_base_paths, tick_period_ms, refresh_period_ticks, true)
+}
+
+/// Like [start_client], but never performs a blocking sync on the calling
+/// (UI) thread. The first sync runs on the background thread right after it
+/// starts, so the caller can build and show its window immediately and the
+/// data simply appears once the sync completes. Used by the networks window so
+/// it stays responsive (and doesn't delay its first paint) when the local
+/// service is slow to respond.
+fn start_client_async(
+    refresh_base_paths: Vec<&'static str>,
+    tick_period_ms: u64,
+    refresh_period_ticks: u64,
+) -> (Arc<Mutex<ServiceClient>>, Arc<AtomicBool>) {
+    start_client_impl(refresh_base_paths, tick_period_ms, refresh_period_ticks, false)
+}
+
+fn start_client_impl(
+    refresh_base_paths: Vec<&'static str>,
+    tick_period_ms: u64,
+    refresh_period_ticks: u64,
+    sync_on_caller_thread: bool,
+) -> (Arc<Mutex<ServiceClient>>, Arc<AtomicBool>) {
     let (mut client, dirty_flag) = ServiceClient::new(refresh_base_paths);
-    client.sync();
+    if sync_on_caller_thread {
+        client.sync();
+    }
 
     let client = Arc::new(Mutex::new(client));
 
     let thread_client = client.clone();
     let _ = std::thread::spawn(move || {
         set_thread_to_background_priority();
+        if !sync_on_caller_thread {
+            // First sync happens off the UI thread so the window can be shown
+            // and stay interactive immediately.
+            thread_client.lock().sync();
+        }
         let mut k = 0_u64;
         loop {
             if thread_client.lock().do_posts() {
