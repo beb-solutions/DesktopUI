@@ -13,3 +13,5 @@
 *.exe
 *.deb
 .vscode/
+# xwin local unpack cache (Windows CRT/SDK download)
+/.xwin-cache/

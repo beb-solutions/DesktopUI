@@ -1,0 +1,14 @@
+[binaries]
+c = '/opt/homebrew/opt/llvm/bin/clang-cl'
+cpp = '/Users/ea/code/beb/DesktopUI/cross/bin/clang-cl'
+ar = '/Users/ea/code/beb/DesktopUI/cross/bin/llvm-lib'
+windres = '/opt/homebrew/opt/llvm/bin/llvm-rc'
+
+[built-in options]
+c_args = ['--target=x86_64-pc-windows-msvc', '-fuse-ld=lld']
+
+[host_machine]
+system = 'windows'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'

@@ -1,0 +1,9 @@
+#!/bin/sh
+args=""
+for a in "$@"; do
+  case "$a" in
+    -std=c++11|/clang:-std=c++11) ;;
+    *) args="$args '$a'" ;;
+  esac
+done
+eval "exec /opt/homebrew/opt/llvm/bin/clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld /clang:-std=c++17 $args"
