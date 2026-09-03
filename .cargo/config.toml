@@ -8,6 +8,18 @@ rustflags=["-C", "link-arg=-mmacosx-version-min=10.13"]
 linker = "/Users/ea/code/beb/DesktopUI/cross/bin/lld-link"
 rustflags = ["-C", "target-feature=+crt-static"]
 
+[target.aarch64-pc-windows-gnullvm]
+linker = "/Users/ea/llvm-mingw/bin/aarch64-w64-mingw32-clang"
+rustflags = [
+    "-C", "link-arg=-fuse-ld=lld",
+    "-C", "link-arg=-luuid",
+    "-C", "link-arg=-Wl,-Bstatic",
+    "-C", "link-arg=-lc++",
+    "-C", "link-arg=-lc++abi",
+    "-C", "link-arg=-lunwind",
+    "-C", "link-arg=-Wl,-Bdynamic",
+]
+
 #[target.i686-pc-windows-msvc]
 #rustflags = ["-C", "target-feature=+crt-static"]
 

@@ -1,0 +1,15 @@
+[binaries]
+c = '/Users/ea/llvm-mingw/bin/aarch64-w64-mingw32-clang'
+cpp = '/Users/ea/llvm-mingw/bin/aarch64-w64-mingw32-clang++'
+ar = '/Users/ea/llvm-mingw/bin/aarch64-w64-mingw32-ar'
+windres = '/Users/ea/llvm-mingw/bin/aarch64-w64-mingw32-windres'
+strip = '/Users/ea/llvm-mingw/bin/aarch64-w64-mingw32-strip'
+
+[built-in options]
+cpp_args = ['-fms-extensions']
+
+[host_machine]
+system = 'windows'
+cpu_family = 'aarch64'
+cpu = 'aarch64'
+endian = 'little'

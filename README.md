@@ -28,7 +28,7 @@ To build on macOS you should just be able to type `make` from the project root. 
 
 To build native applications for Windows, just type `make`. This assumes that GNU make, GCC, and Cargo are in your path. The result will be two native EXEs in `target\x86_64-pc-windows-msvc\release` and `target\i686-pc-windows-msvc\release`. We plan to add native support for Windows on ARM64 soon, both for this UI application and for ZeroTier itself.
 
-To cross-compile the `x86_64-pc-windows-msvc` target from macOS instead, see [CROSS_COMPILE_WINDOWS_MSVC.md](CROSS_COMPILE_WINDOWS_MSVC.md).
+To cross-compile the `x86_64-pc-windows-msvc` target from macOS instead, see [CROSS_COMPILE_WINDOWS_MSVC.md](CROSS_COMPILE_WINDOWS_MSVC.md). For Windows ARM64 (LLVM-MinGW/`aarch64-pc-windows-gnullvm`), see [CROSS_COMPILE_WINDOWS_ARM64.md](CROSS_COMPILE_WINDOWS_ARM64.md).
 
 ## Linux, FreeBSD, Other Open Source Desktops
 
