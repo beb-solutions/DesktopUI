@@ -1,6 +1,7 @@
 #![allow(unexpected_cfgs)]
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
 use std::mem::zeroed;
 use std::os::raw::c_int;
@@ -12,7 +13,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crate::libui;
-use crate::serviceclient::ServiceClient;
+use crate::serviceclient::{ms_since_epoch, ServiceClient};
 
 const WINDOW_SIZE_X: c_int = 600;
 const WINDOW_SIZE_Y: c_int = 480;
@@ -21,6 +22,11 @@ const ROW_H: f64 = 22.0;
 const PAD_L: f64 = 8.0;
 const BUTTON_W: f64 = 88.0;
 const EDGE_W: f64 = 8.0;
+
+/// How long a reconnecting network is shown as "(connecting...)" before it
+/// falls back to whatever status the service reports. Guards against a join
+/// that never completes leaving the entry stuck in the connecting state.
+const CONNECT_TIMEOUT_MS: i64 = 30_000;
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
@@ -71,6 +77,11 @@ struct State {
     content_h: i32,
     pending: Vec<RowAction>,
     rebuild_needed: bool,
+    /// Network IDs currently being reconnected. Value is the name as last
+    /// seen plus the time (ms since epoch) the reconnect was started, so the
+    /// entry can keep showing its name with a "(connecting...)" status until
+    /// the service reports a definitive state.
+    connecting: HashMap<String, (String, i64)>,
 }
 
 static mut G_STATE: *mut State = null_mut();
@@ -159,7 +170,12 @@ fn load_geometry() -> Option<(f64, f64, c_int, c_int)> {
     }
 }
 
-fn compute_rows(client: &ServiceClient, search: &str, sort_by_name: bool) -> Vec<Row> {
+fn compute_rows(
+    client: &ServiceClient,
+    search: &str,
+    sort_by_name: bool,
+    connecting: &HashMap<String, (String, i64)>,
+) -> Vec<Row> {
     let networks = client.networks();
     let saved = client.saved_networks();
 
@@ -167,6 +183,13 @@ fn compute_rows(client: &ServiceClient, search: &str, sort_by_name: bool) -> Vec
     let mut rows: Vec<Row> = Vec::new();
 
     for (id, obj) in networks.iter() {
+        // A reconnecting network is rendered below from the remembered entry
+        // (so its name stays visible) until the service reports a definitive
+        // status; showing the raw REQUESTING_CONFIGURATION object here would
+        // make the row look empty.
+        if connecting.contains_key(id) {
+            continue;
+        }
         let name = obj
             .get("name")
             .and_then(|v| v.as_str())
@@ -194,7 +217,11 @@ fn compute_rows(client: &ServiceClient, search: &str, sort_by_name: bool) -> Vec
 
     let joined_ids: Vec<&String> = networks.iter().map(|(id, _)| id).collect();
     for (id, name, settings) in saved.iter() {
-        if joined_ids.iter().any(|j| *j == id) {
+        let is_connecting = connecting.contains_key(id);
+        // Skip networks already shown as joined -- unless they are reconnecting,
+        // in which case the remembered entry is used so the row can display the
+        // name with a "(connecting...)" status the whole time.
+        if joined_ids.iter().any(|j| *j == id) && !is_connecting {
             continue;
         }
         if !query.is_empty()
@@ -203,10 +230,19 @@ fn compute_rows(client: &ServiceClient, search: &str, sort_by_name: bool) -> Vec
         {
             continue;
         }
+        let display_name = connecting
+            .get(id)
+            .map(|(n, _)| n.clone())
+            .unwrap_or_else(|| name.clone());
+        let status = if is_connecting {
+            "(connecting...)".into()
+        } else {
+            "(not joined)".into()
+        };
         rows.push(Row {
             id: id.clone(),
-            name: name.clone(),
-            status: "(not joined)".into(),
+            name: display_name,
+            status,
             settings: settings.clone(),
             joined: false,
         });
@@ -432,8 +468,13 @@ unsafe extern "C" fn area_draw(
             0.0,
         );
 
-        // Action buttons (right-aligned text, one cell each).
-        let actions: [&str; 2] = if row.joined {
+        // Action buttons (right-aligned text, one cell each). A reconnecting
+        // entry has no usable action yet (the status column already reads
+        // "(connecting...)"), so its second cell is just a busy indicator and
+        // clicks there are ignored in the mouse handler.
+        let actions: [&str; 2] = if state.connecting.contains_key(&row.id) {
+            ["Copy", "…"]
+        } else if row.joined {
             ["Copy", "Disconnect"]
         } else {
             ["Copy", "Reconnect"]
@@ -495,6 +536,11 @@ unsafe extern "C" fn area_mouse(
         crate::copy_to_clipboard(row.id.as_str());
         return;
     }
+    // While a reconnect is in progress the entry is shown as connecting;
+    // further clicks on the action column are ignored.
+    if state.connecting.contains_key(&row.id) {
+        return;
+    }
     if row.joined {
         state.pending.push(RowAction::Disconnect {
             id: row.id,
@@ -502,6 +548,13 @@ unsafe extern "C" fn area_mouse(
             settings: row.settings,
         });
     } else {
+        // Remember that this network is being reconnected so the row keeps
+        // showing its name with a "(connecting...)" status until the service
+        // reports the new state.
+        state.connecting.insert(
+            row.id.clone(),
+            (row.name.clone(), ms_since_epoch()),
+        );
         state.pending.push(RowAction::Reconnect {
             id: row.id,
             settings: row.settings,
@@ -527,16 +580,50 @@ unsafe extern "C" fn area_key(
     0
 }
 
+/// Drop reconnecting entries that have reached a definitive state (the service
+/// now reports a real status such as OK / AUTHENTICATION_REQUIRED) or that have
+/// been trying for longer than [CONNECT_TIMEOUT_MS]. The row then shows the
+/// actual state reported by the service again.
+fn prune_connecting(client: &ServiceClient, connecting: &mut HashMap<String, (String, i64)>) {
+    let now = ms_since_epoch();
+    let networks = client.networks();
+    connecting.retain(|id, (_, start)| {
+        if now - *start > CONNECT_TIMEOUT_MS {
+            return false;
+        }
+        let status = networks
+            .iter()
+            .find(|(n, _)| n == id)
+            .and_then(|(_, o)| o.get("status"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
+        match status {
+            // Not (yet) reported, or still being configured: keep connecting.
+            "" | "REQUESTING_CONFIGURATION" => true,
+            _ => false,
+        }
+    });
+}
+
 /// Recompute the row list and repaint, but only if the service client lock is
 /// free right now. Returns false when the background sync thread is holding
 /// the lock; callers keep the rebuild flag set and retry on the next timer
 /// tick. This keeps the UI thread responsive even while a (slow) service sync
 /// is running.
 fn try_rebuild(state: &mut State) -> bool {
-    let Some(guard) = state.client.try_lock() else {
+    // Clone the Arc so the guard doesn't hold a borrow of `state` and we can
+    // also touch `state.connecting` below.
+    let client = state.client.clone();
+    let Some(guard) = client.try_lock() else {
         return false;
     };
-    let rows = compute_rows(&guard, &state.search, state.sort_by_name);
+    prune_connecting(&guard, &mut state.connecting);
+    let rows = compute_rows(
+        &guard,
+        &state.search,
+        state.sort_by_name,
+        &state.connecting,
+    );
     drop(guard);
     state.rows = rows;
     state.rebuild_needed = false;
@@ -725,6 +812,7 @@ pub fn networks_main() {
             content_h: 60,
             pending: Vec::new(),
             rebuild_needed: true,
+            connecting: HashMap::new(),
         });
         let state_ptr = Box::into_raw(state);
         G_STATE = state_ptr;
