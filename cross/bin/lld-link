@@ -1,0 +1,18 @@
+#!/bin/sh
+# Linker wrapper for x86_64-pc-windows-msvc. rustc calls the MSVC linker as
+# `lld -flavor link`, which only the multi-call lld accepts; Meson finds this
+# wrapper on PATH and calls it without a flavor, so link is selected then. lld
+# also does not add link.exe's default libraries or know where xwin put the
+# CRT/SDK.
+LLD="${LLD:-/opt/homebrew/opt/lld/bin/lld}"
+XWIN_DIR="${XWIN_DIR:-$HOME/.xwin}"
+if [ "$1" != "-flavor" ]; then
+  set -- -flavor link "$@"
+fi
+exec "$LLD" \
+  "$@" \
+  "/libpath:$XWIN_DIR/crt/lib/x86_64" \
+  "/libpath:$XWIN_DIR/sdk/lib/um/x86_64" \
+  "/libpath:$XWIN_DIR/sdk/lib/ucrt/x86_64" \
+  kernel32.lib user32.lib gdi32.lib winspool.lib comdlg32.lib advapi32.lib \
+  shell32.lib ole32.lib oleaut32.lib uuid.lib odbc32.lib odbccp32.lib

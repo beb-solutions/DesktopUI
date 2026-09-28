@@ -13,3 +13,7 @@
 *.exe
 *.deb
 .vscode/
+# xwin local unpack cache (Windows CRT/SDK download)
+/.xwin-cache/
+# machine-specific paths for the Meson cross files (written by cross/env.sh)
+/cross/local.ini

@@ -1,0 +1,12 @@
+#!/bin/sh
+# llvm-lib wrapper: Meson derives /MACHINE from the build host (arm), so any
+# machine flag it passes is dropped and /MACHINE:X64 is forced.
+LLVM_BIN="${LLVM_BIN:-/opt/homebrew/opt/llvm/bin}"
+for a do
+  shift
+  case "$a" in
+    /MACHINE:*|-MACHINE:*) ;;
+    *) set -- "$@" "$a" ;;
+  esac
+done
+exec "$LLVM_BIN/llvm-lib" "$@" /MACHINE:X64
