@@ -651,14 +651,40 @@ unsafe fn make_layout(
     (tl, s)
 }
 
-unsafe fn text_size(font: &libui::uiFontDescriptor, text: &str, style: TextStyle) -> (f64, f64) {
+/// Text widths by text and size-relevant style bits (color does not change
+/// a width). Measuring builds a whole CoreText layout (~1 ms), and every
+/// change to the row list re-fits all texts, so without this the UI thread
+/// stalled for hundreds of milliseconds after opening the window, while the
+/// first sync landed, and the search field could not be clicked.
+type WidthKey = (String, i32, bool, u64);
+
+const WIDTH_CACHE_MAX: usize = 4096;
+
+/// Only touched from the UI thread, like G_STATE.
+static mut WIDTH_CACHE: Option<HashMap<WidthKey, f64>> = None;
+
+unsafe fn text_width(font: &libui::uiFontDescriptor, text: &str, style: TextStyle) -> f64 {
+    let key: WidthKey = (
+        text.to_string(),
+        style.weight as i32,
+        style.mono,
+        style.size_delta.to_bits(),
+    );
+    let cache = (*std::ptr::addr_of_mut!(WIDTH_CACHE)).get_or_insert_with(HashMap::new);
+    if let Some(w) = cache.get(&key) {
+        return *w;
+    }
     let (tl, s) = make_layout(font, text, 10_000.0, style);
     let mut w: f64 = 0.0;
     let mut h: f64 = 0.0;
     libui::uiDrawTextLayoutExtents(tl, &mut w, &mut h);
     libui::uiDrawFreeTextLayout(tl);
     libui::uiFreeAttributedString(s);
-    (w, h)
+    if cache.len() >= WIDTH_CACHE_MAX {
+        cache.clear();
+    }
+    cache.insert(key, w);
+    w
 }
 
 /// Shorten text with an ellipsis until it fits into max_w on one line.
@@ -666,7 +692,7 @@ unsafe fn fit_text(font: &libui::uiFontDescriptor, text: &str, style: TextStyle,
     if max_w <= 0.0 {
         return String::new();
     }
-    if text_size(font, text, style).0 <= max_w {
+    if text_width(font, text, style) <= max_w {
         return text.to_string();
     }
     let chars: Vec<char> = text.chars().collect();
@@ -674,7 +700,7 @@ unsafe fn fit_text(font: &libui::uiFontDescriptor, text: &str, style: TextStyle,
     while lo < hi {
         let mid = (lo + hi + 1) / 2;
         let candidate: String = chars[..mid].iter().collect::<String>() + "…";
-        if text_size(font, &candidate, style).0 <= max_w {
+        if text_width(font, &candidate, style) <= max_w {
             lo = mid;
         } else {
             hi = mid - 1;
@@ -839,7 +865,7 @@ unsafe fn build_text_cache(font: &libui::uiFontDescriptor, state: &State) -> Tex
     let palette = &LIGHT_PALETTE;
     let buttons = button_rects(state.content_w);
     let text_right = buttons[0].0 - COL_GAP;
-    let id_w = text_size(font, "0000000000000000", id_style(palette)).0;
+    let id_w = text_width(font, "0000000000000000", id_style(palette));
     let avail = text_right - TEXT_X;
     let base_name_w = ((avail - id_w - 2.0 * COL_GAP) * 0.55).clamp(90.0, 280.0);
     let show_id = TEXT_X + base_name_w + COL_GAP + id_w <= text_right;
