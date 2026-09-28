@@ -1,9 +1,13 @@
 #!/bin/sh
-args=""
-for a in "$@"; do
+# clang-cl wrapper for the C++ side of the libui-ng Windows x64 cross build.
+# Meson forces -std=c++11, but the current MSVC STL needs C++14+, so the
+# injected standard is dropped and C++17 is enforced instead.
+LLVM_BIN="${LLVM_BIN:-/opt/homebrew/opt/llvm/bin}"
+for a do
+  shift
   case "$a" in
     -std=c++11|/clang:-std=c++11) ;;
-    *) args="$args '$a'" ;;
+    *) set -- "$@" "$a" ;;
   esac
 done
-eval "exec /opt/homebrew/opt/llvm/bin/clang-cl --target=x86_64-pc-windows-msvc -fuse-ld=lld /clang:-std=c++17 $args"
+exec "$LLVM_BIN/clang-cl" --target=x86_64-pc-windows-msvc -fuse-ld=lld /clang:-std=c++17 "$@"

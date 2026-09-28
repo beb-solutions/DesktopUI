@@ -41,6 +41,7 @@ pub struct ServiceClient {
     address: IpAddr,
     base_url: String,
     saved_networks: Map<String, Value>,
+    saved_networks_stamp: Option<(SystemTime, u64)>,
     state_hash: HashMap<String, u64>,
     state: Map<String, Value>,
     post_queue: LinkedList<(String, String)>,
@@ -201,6 +202,21 @@ pub fn get_auth_token_and_port(
     }
 }
 
+/// Modification time and length of the saved networks file. The tray and the
+/// networks window each run their own client in a separate process, so this is
+/// how one of them notices that the other changed the file.
+fn saved_networks_stamp() -> Option<(SystemTime, u64)> {
+    std::fs::metadata(crate::NETWORK_CACHE_PATH.as_str())
+        .ok()
+        .map(|m| (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len()))
+}
+
+fn read_saved_networks() -> Option<Map<String, Value>> {
+    std::fs::read(crate::NETWORK_CACHE_PATH.as_str())
+        .ok()
+        .and_then(|j| serde_json::from_slice(j.as_slice()).ok())
+}
+
 const SEP_BYTE: [u8; 1] = [0_u8];
 
 fn hash_result(v: &Value, h: &mut crc64::Crc64) {
@@ -250,14 +266,8 @@ impl ServiceClient {
                 port: 0,
                 address: IpAddr::V4(Ipv4Addr::LOCALHOST),
                 base_url: String::new(),
-                saved_networks: std::fs::read(crate::NETWORK_CACHE_PATH.as_str())
-                    .map_or_else(
-                        |_| serde_json::Map::new(),
-                        |j| {
-                            serde_json::from_slice(j.as_slice())
-                                .map_or_else(|_| serde_json::Map::new(), |r| r)
-                        },
-                    ),
+                saved_networks_stamp: saved_networks_stamp(),
+                saved_networks: read_saved_networks().unwrap_or_default(),
                 state_hash: HashMap::new(),
                 state: Map::new(),
                 post_queue: LinkedList::new(),
@@ -270,6 +280,13 @@ impl ServiceClient {
             },
             dirty_flag,
         )
+    }
+
+    /// Never prompt for elevated privileges to fetch the auth token. For
+    /// secondary windows: the tray already asks once at startup, and a second
+    /// prompt popping up from a window the user just opened is confusing.
+    pub fn disable_privilege_escalation(&mut self) {
+        self.try_escalate_privs = 0;
     }
 
     #[inline(always)]
@@ -547,34 +564,64 @@ impl ServiceClient {
         }
     }
 
+    /// Pick up changes another UI process made to the saved networks file.
+    /// An unreadable file (e.g. deleted) leaves the current list alone.
+    fn reload_saved_networks(&mut self) {
+        let stamp = saved_networks_stamp();
+        if stamp.is_none() || stamp == self.saved_networks_stamp {
+            return;
+        }
+        if let Some(saved_networks) = read_saved_networks() {
+            self.saved_networks = saved_networks;
+            self.saved_networks_stamp = stamp;
+            self.publish_saved_networks();
+        }
+    }
+
+    fn publish_saved_networks(&mut self) {
+        self.state.insert(
+            "saved_networks".into(),
+            serde_json::Value::from(self.saved_networks.clone()),
+        );
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Write the saved networks file via a temporary file and a rename, so the
+    /// other UI process never reads a half-written file.
+    fn write_saved_networks(&mut self) {
+        let path = crate::NETWORK_CACHE_PATH.as_str();
+        let tmp = format!("{}.{}.tmp", path, std::process::id());
+        let _ = serde_json::to_vec(&self.saved_networks).map(|json| {
+            if std::fs::write(&tmp, &json).is_err() || std::fs::rename(&tmp, path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+                let _ = std::fs::write(path, &json);
+            }
+        });
+        self.saved_networks_stamp = saved_networks_stamp();
+    }
+
     pub fn remember_network(&mut self, id: String, name: String, settings: String) {
+        // Merge with whatever the other UI process saved since our last sync.
+        self.reload_saved_networks();
         let mut n: serde_json::Map<String, Value> = serde_json::Map::new();
         n.insert("id".into(), Value::from(id.clone()));
         n.insert("name".into(), Value::from(name));
         n.insert("settings".into(), Value::from(settings));
         self.saved_networks.insert(id, Value::from(n));
-        self.state.insert(
-            "saved_networks".into(),
-            serde_json::Value::from(self.saved_networks.clone()),
-        );
-        let _ = serde_json::to_vec(&self.saved_networks)
-            .map(|json| std::fs::write(crate::NETWORK_CACHE_PATH.as_str(), &json));
-        self.dirty.store(true, Ordering::Relaxed);
+        self.write_saved_networks();
+        self.publish_saved_networks();
     }
 
     pub fn forget_network(&mut self, id: &String) {
+        self.reload_saved_networks();
         self.saved_networks.remove(id);
-        self.state.insert(
-            "saved_networks".into(),
-            serde_json::Value::from(self.saved_networks.clone()),
-        );
-        let _ = serde_json::to_vec(&self.saved_networks)
-            .map(|json| std::fs::write(crate::NETWORK_CACHE_PATH.as_str(), &json));
-        self.dirty.store(true, Ordering::Relaxed);
+        self.write_saved_networks();
+        self.publish_saved_networks();
     }
 
     /// Submit queued posts and get current service state.
     pub fn sync(&mut self) {
+        self.reload_saved_networks();
         if !self.is_initialized() || !self.is_online() {
             self.sync_client_config();
             self.state.insert(

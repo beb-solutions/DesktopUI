@@ -1,8 +1,10 @@
+# Needs the constants from cross/local.ini (written by `. cross/env.sh x64`),
+# passed as an earlier --cross-file.
 [binaries]
-c = '/opt/homebrew/opt/llvm/bin/clang-cl'
-cpp = '/Users/ea/code/beb/DesktopUI/cross/bin/clang-cl'
-ar = '/Users/ea/code/beb/DesktopUI/cross/bin/llvm-lib'
-windres = '/opt/homebrew/opt/llvm/bin/llvm-rc'
+c = llvm_bin / 'clang-cl'
+cpp = repo / 'cross/bin/clang-cl'
+ar = repo / 'cross/bin/llvm-lib'
+windres = llvm_bin / 'llvm-rc'
 
 [built-in options]
 c_args = ['--target=x86_64-pc-windows-msvc', '-fuse-ld=lld']

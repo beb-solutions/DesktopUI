@@ -2588,7 +2588,7 @@ dependencies = [
  "libc",
  "mac-notification-sys 0.5.0",
  "notify-rust",
- "objc",
+ "objc2",
  "parking_lot",
  "plist",
  "runas",

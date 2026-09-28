@@ -5,10 +5,11 @@ macOS (Apple Silicon) host. The result is a statically linked
 (`+crt-static`) Windows GUI executable with no MSVC/MinGW runtime DLL
 dependency.
 
-> Note: this documents the toolchain and the pitfalls we hit. All paths are
-> machine-specific (`/opt/homebrew`, `~/.xwin`, repo location) and must be
-> adjusted if your layout differs. Only `x86_64` is covered; `i686` (32-bit)
-> is out of scope here.
+> Note: this documents the toolchain and the pitfalls we hit. Toolchain
+> locations default to Homebrew on Apple Silicon (`/opt/homebrew`) and
+> `~/.xwin`; override them via environment variables (see below) if your
+> layout differs. Only `x86_64` is covered; `i686` (32-bit) is out of scope
+> here.
 
 ## Prerequisites / installation
 
@@ -38,8 +39,28 @@ Two layout notes:
 
 ## Helper scripts (`cross/`)
 
-These wrappers encode the workarounds below and are referenced from the Meson
-cross file / cargo config:
+Nothing in the checked-in `.cargo/config.toml` refers to these, so native
+builds and CI are unaffected. Everything is switched on per shell by sourcing
+the environment script from the repository root:
+
+```sh
+. cross/env.sh x64
+```
+
+It sets the cargo linker/rustflags for the target
+(`CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_*`, including `+crt-static`), the
+`INCLUDE`, `CFLAGS_*` and `AR_*` variables for C code, puts `cross/bin` on
+`PATH`, and writes `cross/local.ini` (gitignored) with the machine-specific
+paths the Meson cross file uses. Defaults can be overridden before sourcing:
+
+| variable           | default                          |
+| ------------------ | -------------------------------- |
+| `LLVM_BIN`         | `/opt/homebrew/opt/llvm/bin`     |
+| `LLD`              | `/opt/homebrew/opt/lld/bin/lld`  |
+| `XWIN_DIR`         | `~/.xwin`                        |
+| `XWIN_SDK_VERSION` | `10.0.26100`                     |
+
+The wrappers encode the workarounds below:
 
 * `cross/bin/clang-cl` – C++ compiler wrapper. Meson forces `cpp_std=c++11`,
   but the current MSVC STL needs C++14+. The wrapper drops the injected
@@ -51,10 +72,8 @@ cross file / cargo config:
   the multi-call `lld` (`-flavor link`); the wrapper appends the xwin
   `/libpath` directories plus the default Windows libraries that `link.exe`
   would add automatically but `lld` does not.
-* `cross/x86_64-windows-msvc-clang.txt` – Meson cross file.
-
-The wrappers contain absolute paths to `/opt/homebrew` (Homebrew on Apple
-Silicon) and `~/.xwin`; adjust if needed.
+* `cross/x86_64-windows-msvc-clang.txt` – Meson cross file. It needs the
+  constants from `cross/local.ini`, which must come first on the command line.
 
 ## 1. Build libui-ng (Windows, static)
 
@@ -64,15 +83,15 @@ with `/U`), so a repo under `/Users` must not be used as the source/build
 directory for clang-cl.
 
 ```sh
+. cross/env.sh x64                 # from the repo root
+
 rm -rf /tmp/ztwin && mkdir -p /tmp/ztwin
 cp -R libui-ng /tmp/ztwin/libui-ng
-
-export XW=~/.xwin
-export INCLUDE="$XW/crt/include;$XW/sdk/include/10.0.26100/ucrt;$XW/sdk/include/10.0.26100/um;$XW/sdk/include/10.0.26100/shared"
-export PATH="$PWD/cross/bin:$PATH"
+rm -rf /tmp/ztwin/libui-ng/build   # don't carry over a native build dir
 
 cd /tmp/ztwin/libui-ng
 meson setup build-win \
+  --cross-file <repo>/cross/local.ini \
   --cross-file <repo>/cross/x86_64-windows-msvc-clang.txt \
   --buildtype=release -Db_vscrt=mt --default-library=static --backend=ninja
 ninja -C build-win meson-out/libui.a
@@ -98,20 +117,14 @@ x86_64-w64-mingw32-ar rcs <repo>/tray/zt_desktop_tray.lib /tmp/zt_desktop_tray_w
 
 ## 3. Build the Rust binary
 
-`.cargo/config.toml` already pins the target to the `lld-link` wrapper with
-`+crt-static`. The extra env below is only needed for C dependencies built by
-`cc-rs` (e.g. `ring`): the host `cc`/`clang` is used to compile them for the
-Windows target, so it needs the SDK headers and an MSVC-style archiver.
+With the environment from `. cross/env.sh x64` (same shell as above, or
+source it again), cargo links through the `lld-link` wrapper with
+`+crt-static`. The script also exports `CFLAGS_x86_64_pc_windows_msvc` and
+`AR_x86_64_pc_windows_msvc` for C dependencies built by `cc-rs` (e.g.
+`ring`): the host `cc`/`clang` compiles them for the Windows target, so it
+needs the SDK headers and an MSVC-style archiver.
 
 ```sh
-export PATH="<repo>/cross/bin:$PATH"
-export CFLAGS_x86_64_pc_windows_msvc="\
-  -isystem$XW/crt/include \
-  -isystem$XW/sdk/include/10.0.26100/ucrt \
-  -isystem$XW/sdk/include/10.0.26100/um \
-  -isystem$XW/sdk/include/10.0.26100/shared"
-export AR_x86_64_pc_windows_msvc="<repo>/cross/bin/llvm-lib"
-
 cargo build --target x86_64-pc-windows-msvc
 # release:
 # cargo build --release --target x86_64-pc-windows-msvc

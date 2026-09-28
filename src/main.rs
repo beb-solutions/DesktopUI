@@ -408,7 +408,8 @@ fn start_client(
 /// starts, so the caller can build and show its window immediately and the
 /// data simply appears once the sync completes. Used by the networks window so
 /// it stays responsive (and doesn't delay its first paint) when the local
-/// service is slow to respond.
+/// service is slow to respond. It also never asks for elevated privileges to
+/// read the auth token; that prompt belongs to the tray.
 fn start_client_async(
     refresh_base_paths: Vec<&'static str>,
     tick_period_ms: u64,
@@ -426,6 +427,8 @@ fn start_client_impl(
     let (mut client, dirty_flag) = ServiceClient::new(refresh_base_paths);
     if sync_on_caller_thread {
         client.sync();
+    } else {
+        client.disable_privilege_escalation();
     }
 
     let client = Arc::new(Mutex::new(client));
@@ -504,6 +507,7 @@ fn tray_main() {
 
     let (client, dirty_flag) = start_client(vec!["status", "network"], 250, 10);
     let about_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+    let networks_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
     let joining: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let join_window_open = Arc::new(AtomicBool::new(false));
     let sso_notification_shown: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -566,14 +570,21 @@ fn tray_main() {
                 })),
             });
 
+            let networks_child2 = networks_child.clone();
             menu.push(TrayMenuItem::Text {
                 text: "Show Networks...".into(),
                 checked: false,
                 disabled: false,
-                handler: Some(Box::new(|| {
-                    let _ = Command::new(std::env::current_exe().unwrap())
-                        .arg("networks")
-                        .spawn();
+                handler: Some(Box::new(move || {
+                    let mut child = networks_child2.lock();
+                    if child.is_none() {
+                        let ch = Command::new(std::env::current_exe().unwrap())
+                            .arg("networks")
+                            .spawn();
+                        if ch.is_ok() {
+                            let _ = child.insert(ch.unwrap());
+                        }
+                    }
                 })),
             });
 
@@ -1101,13 +1112,16 @@ fn tray_main() {
     let tray = Tray::init(icon_name.as_ref(), refresh());
 
     loop {
-        // Reap subprocesses if finished.
-        for child in [&about_child].iter() {
+        // Reap subprocesses if finished. try_wait() returns Ok(None) while the
+        // child is still running, so only an exit status (or an error) frees
+        // the slot for a new window.
+        for child in [&about_child, &networks_child].iter() {
             let mut child = child.lock();
-            if child.is_some() {
-                if child.as_mut().unwrap().try_wait().is_ok() {
-                    let _ = child.take();
-                }
+            if child
+                .as_mut()
+                .is_some_and(|c| !matches!(c.try_wait(), Ok(None)))
+            {
+                let _ = child.take();
             }
         }
 
@@ -1142,7 +1156,7 @@ fn tray_main() {
         }
     }
 
-    for child in [&about_child].iter() {
+    for child in [&about_child, &networks_child].iter() {
         let mut child = child.lock();
         child.take().map(|mut c| c.kill());
     }

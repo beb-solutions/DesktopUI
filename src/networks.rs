@@ -1,5 +1,3 @@
-#![allow(unexpected_cfgs)]
-
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr, CString};
@@ -37,11 +35,84 @@ struct NSPoint {
 }
 
 #[cfg(target_os = "macos")]
+unsafe impl objc2::Encode for NSPoint {
+    const ENCODING: objc2::Encoding =
+        objc2::Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+}
+
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct NSSize {
     width: f64,
     height: f64,
+}
+
+#[cfg(target_os = "macos")]
+unsafe impl objc2::Encode for NSSize {
+    const ENCODING: objc2::Encoding =
+        objc2::Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
+}
+
+/// Colors for the network list, since libui drawing has no notion of the
+/// system theme.
+struct Palette {
+    background: (f64, f64, f64),
+    stripe: (f64, f64, f64),
+    joined: (f64, f64, f64),
+    separator: (f64, f64, f64),
+    text: (f64, f64, f64),
+    muted: (f64, f64, f64),
+    action: (f64, f64, f64),
+}
+
+const LIGHT_PALETTE: Palette = Palette {
+    background: (1.0, 1.0, 1.0),
+    stripe: (0.95, 0.95, 0.95),
+    joined: (0.88, 0.97, 0.89),
+    separator: (0.88, 0.88, 0.88),
+    text: (0.0, 0.0, 0.0),
+    muted: (0.4, 0.4, 0.4),
+    action: (0.0, 0.45, 0.9),
+};
+
+#[cfg(target_os = "macos")]
+const DARK_PALETTE: Palette = Palette {
+    background: (0.12, 0.12, 0.12),
+    stripe: (0.16, 0.16, 0.16),
+    joined: (0.12, 0.26, 0.15),
+    separator: (0.24, 0.24, 0.24),
+    text: (0.92, 0.92, 0.92),
+    muted: (0.6, 0.6, 0.6),
+    action: (0.3, 0.62, 1.0),
+};
+
+/// Palette for the appearance the area is currently being drawn in. Only
+/// valid inside the draw handler: AppKit sets the current appearance to the
+/// view's effective appearance while it draws.
+#[cfg(target_os = "macos")]
+unsafe fn current_palette() -> &'static Palette {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    let appearance: *mut AnyObject = msg_send![class!(NSAppearance), currentAppearance];
+    if appearance.is_null() {
+        return &LIGHT_PALETTE;
+    }
+    let name: *mut AnyObject = msg_send![appearance, name];
+    if name.is_null() {
+        return &LIGHT_PALETTE;
+    }
+    let name: *const std::os::raw::c_char = msg_send![name, UTF8String];
+    if !name.is_null() && CStr::from_ptr(name).to_string_lossy().contains("Dark") {
+        &DARK_PALETTE
+    } else {
+        &LIGHT_PALETTE
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+unsafe fn current_palette() -> &'static Palette {
+    &LIGHT_PALETTE
 }
 
 #[derive(Clone)]
@@ -74,7 +145,8 @@ struct State {
     area: *mut libui::uiArea,
     rows: Vec<Row>,
     content_w: f64,
-    content_h: i32,
+    /// Size last passed to uiAreaSetSize.
+    area_size: (c_int, c_int),
     pending: Vec<RowAction>,
     rebuild_needed: bool,
     /// Network IDs currently being reconnected. Value is the name as last
@@ -82,6 +154,8 @@ struct State {
     /// entry can keep showing its name with a "(connecting...)" status until
     /// the service reports a definitive state.
     connecting: HashMap<String, (String, i64)>,
+    /// Whether the service answered the last sync; drives the empty-list hint.
+    online: bool,
 }
 
 static mut G_STATE: *mut State = null_mut();
@@ -100,12 +174,13 @@ fn geometry_path() -> String {
 /// usable width (scrollbars etc. included). Returns <= 0 when unknown.
 #[cfg(target_os = "macos")]
 unsafe fn area_viewport_width(area: *mut libui::uiArea) -> f64 {
-    use objc::{msg_send, sel, sel_impl};
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
     let handle = libui::uiControlHandle(area.cast());
     if handle == 0 {
         return 0.0;
     }
-    let sv = handle as *mut objc::runtime::Object;
+    let sv = handle as *mut AnyObject;
     let sz: NSSize = msg_send![sv, contentSize];
     sz.width
 }
@@ -115,31 +190,114 @@ unsafe fn area_viewport_width(_area: *mut libui::uiArea) -> f64 {
     0.0
 }
 
+/// Window position as the platform reports it (macOS: bottom-left frame
+/// origin, Windows: top-left corner, both in screen coordinates).
 #[cfg(target_os = "macos")]
-fn window_frame_origin(window: *mut libui::uiWindow) -> Option<(f64, f64)> {
+fn window_position(window: *mut libui::uiWindow) -> Option<(f64, f64)> {
     unsafe {
-        use objc::{msg_send, sel, sel_impl};
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
         let handle = libui::uiControlHandle(window.cast());
         if handle == 0 {
             return None;
         }
-        let win = handle as *mut objc::runtime::Object;
+        let win = handle as *mut AnyObject;
         let p: NSPoint = msg_send![win, frameOrigin];
         Some((p.x, p.y))
     }
 }
 
+/// Move the window to a saved position. If that spot is no longer on any
+/// screen (monitor unplugged, resolution changed) the window is centered.
 #[cfg(target_os = "macos")]
-fn window_set_frame_origin(window: *mut libui::uiWindow, x: f64, y: f64) {
+fn window_restore_position(window: *mut libui::uiWindow, x: f64, y: f64) {
     unsafe {
-        use objc::{msg_send, sel, sel_impl};
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
         let handle = libui::uiControlHandle(window.cast());
         if handle == 0 {
             return;
         }
-        let win = handle as *mut objc::runtime::Object;
+        let win = handle as *mut AnyObject;
         let _: () = msg_send![win, setFrameOrigin: NSPoint { x, y }];
+        let screen: *mut AnyObject = msg_send![win, screen];
+        if screen.is_null() {
+            let _: () = msg_send![win, center];
+        }
     }
+}
+
+#[cfg(windows)]
+fn window_position(window: *mut libui::uiWindow) -> Option<(f64, f64)> {
+    use winapi::shared::windef::{HWND, RECT};
+    use winapi::um::winuser::GetWindowRect;
+    unsafe {
+        let hwnd = libui::uiControlHandle(window.cast()) as HWND;
+        if hwnd.is_null() {
+            return None;
+        }
+        let mut r: RECT = zeroed();
+        if GetWindowRect(hwnd, &mut r) == 0 {
+            return None;
+        }
+        Some((r.left as f64, r.top as f64))
+    }
+}
+
+/// Move the window to a saved position, unless that spot is no longer on any
+/// monitor; then the default placement is kept.
+#[cfg(windows)]
+fn window_restore_position(window: *mut libui::uiWindow, x: f64, y: f64) {
+    use winapi::shared::windef::{HWND, RECT};
+    use winapi::um::winuser::{
+        GetWindowRect, MonitorFromRect, SetWindowPos, MONITOR_DEFAULTTONULL, SWP_NOACTIVATE,
+        SWP_NOSIZE, SWP_NOZORDER,
+    };
+    unsafe {
+        let hwnd = libui::uiControlHandle(window.cast()) as HWND;
+        if hwnd.is_null() {
+            return;
+        }
+        let mut r: RECT = zeroed();
+        if GetWindowRect(hwnd, &mut r) == 0 {
+            return;
+        }
+        let (x, y) = (x as i32, y as i32);
+        let target = RECT {
+            left: x,
+            top: y,
+            right: x + (r.right - r.left),
+            bottom: y + (r.bottom - r.top),
+        };
+        if MonitorFromRect(&target, MONITOR_DEFAULTTONULL).is_null() {
+            return;
+        }
+        SetWindowPos(
+            hwnd,
+            null_mut(),
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Positioning is not supported here (and Wayland does not allow it at all),
+/// so only the size is restored.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn window_position(_window: *mut libui::uiWindow) -> Option<(f64, f64)> {
+    None
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn window_restore_position(_window: *mut libui::uiWindow, _x: f64, _y: f64) {}
+
+struct Geometry {
+    position: Option<(f64, f64)>,
+    width: c_int,
+    height: c_int,
 }
 
 fn save_geometry(window: *mut libui::uiWindow) {
@@ -147,24 +305,28 @@ fn save_geometry(window: *mut libui::uiWindow) {
         let mut w: c_int = 0;
         let mut h: c_int = 0;
         libui::uiWindowContentSize(window, &mut w, &mut h);
-        #[cfg(target_os = "macos")]
-        let (x, y) = window_frame_origin(window).unwrap_or((0.0, 0.0));
-        #[cfg(not(target_os = "macos"))]
-        let (x, y) = (0.0f64, 0.0f64);
-        let geom = serde_json::json!({ "x": x, "y": y, "width": w, "height": h });
+        let mut geom = serde_json::json!({ "width": w, "height": h });
+        if let Some((x, y)) = window_position(window) {
+            geom["x"] = x.into();
+            geom["y"] = y.into();
+        }
         let _ = std::fs::write(geometry_path(), serde_json::to_vec(&geom).unwrap());
     }
 }
 
-fn load_geometry() -> Option<(f64, f64, c_int, c_int)> {
+fn load_geometry() -> Option<Geometry> {
     let data = std::fs::read(geometry_path()).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&data).ok()?;
-    let x = v.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let y = v.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let x = v.get("x").and_then(|v| v.as_f64());
+    let y = v.get("y").and_then(|v| v.as_f64());
     let w = v.get("width").and_then(|v| v.as_i64()).unwrap_or(0) as c_int;
     let h = v.get("height").and_then(|v| v.as_i64()).unwrap_or(0) as c_int;
     if w >= 200 && h >= 200 {
-        Some((x, y, w, h))
+        Some(Geometry {
+            position: x.zip(y),
+            width: w,
+            height: h,
+        })
     } else {
         None
     }
@@ -296,10 +458,11 @@ fn row_label(r: &Row) -> String {
 fn update_area(state: &mut State) {
     let nrows = state.rows.len() as i32;
     let h = if nrows == 0 { 60 } else { nrows * (ROW_H as i32) };
-    if state.content_h != h {
-        state.content_h = h;
+    let size = (state.content_w as c_int, h);
+    if state.area_size != size {
+        state.area_size = size;
         unsafe {
-            libui::uiAreaSetSize(state.area, state.content_w as c_int, h);
+            libui::uiAreaSetSize(state.area, size.0, size.1);
         }
     }
     unsafe {
@@ -321,9 +484,11 @@ unsafe fn make_layout(
     g: f64,
     b: f64,
 ) -> (*mut libui::uiDrawTextLayout, *mut libui::uiAttributedString) {
-    let c = CString::new(text).unwrap();
+    // Network names come from the controller and may contain NUL, which a
+    // C string cannot hold; drop it rather than failing.
+    let c = CString::new(text.replace('\0', "")).unwrap();
     let s = libui::uiNewAttributedString(c.as_ptr());
-    let len = text.len();
+    let len = c.as_bytes().len();
     let attr = libui::uiNewColorAttribute(r, g, b, 1.0);
     // The attributed string takes ownership of the attribute.
     libui::uiAttributedStringSetAttribute(s, attr, 0, len);
@@ -337,7 +502,14 @@ unsafe fn make_layout(
     (tl, s)
 }
 
-unsafe fn fill_rect(ctx: *mut libui::uiDrawContext, x: f64, y: f64, w: f64, h: f64, r: f64, g: f64, b: f64, a: f64) {
+unsafe fn fill_rect(
+    ctx: *mut libui::uiDrawContext,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    (r, g, b): (f64, f64, f64),
+) {
     let path = libui::uiDrawNewPath(libui::uiDrawFillModeWinding);
     libui::uiDrawPathAddRectangle(path, x, y, w, h);
     libui::uiDrawPathEnd(path);
@@ -346,7 +518,7 @@ unsafe fn fill_rect(ctx: *mut libui::uiDrawContext, x: f64, y: f64, w: f64, h: f
     brush.R = r;
     brush.G = g;
     brush.B = b;
-    brush.A = a;
+    brush.A = 1.0;
     libui::uiDrawFill(ctx, path, &mut brush);
     libui::uiDrawFreePath(path);
 }
@@ -358,9 +530,7 @@ unsafe fn draw_text(
     x: f64,
     y_center: f64,
     max_w: f64,
-    r: f64,
-    g: f64,
-    b: f64,
+    (r, g, b): (f64, f64, f64),
 ) {
     let (tl, s) = make_layout(font, text, max_w.max(1.0), r, g, b);
     let mut tw: f64 = 0.0;
@@ -379,9 +549,7 @@ unsafe fn draw_text_right(
     text: &str,
     right_x: f64,
     y_center: f64,
-    r: f64,
-    g: f64,
-    b: f64,
+    (r, g, b): (f64, f64, f64),
 ) {
     let (tl, s) = make_layout(font, text, 4000.0, r, g, b);
     let mut tw: f64 = 0.0;
@@ -400,14 +568,7 @@ unsafe extern "C" fn area_draw(
     let state = &mut *G_STATE;
     let dp = &*dp;
     let ctx = dp.Context;
-
-    // Keep the drawn content width matched to the actual viewport so the
-    // rightmost action column always fits (no horizontal overflow).
-    let vw = area_viewport_width(state.area);
-    if vw >= 60.0 && (vw - state.content_w).abs() > 0.5 {
-        state.content_w = vw;
-        libui::uiAreaSetSize(state.area, state.content_w as c_int, state.content_h);
-    }
+    let palette = current_palette();
 
     let mut font = load_font();
 
@@ -418,27 +579,24 @@ unsafe extern "C" fn area_draw(
         dp.ClipY,
         state.content_w.max(dp.ClipWidth),
         dp.ClipHeight,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
+        palette.background,
     );
 
     if state.rows.is_empty() {
         draw_text(
             ctx,
             &font,
-            if state.search.is_empty() {
-                "No networks found"
-            } else {
+            if !state.search.is_empty() {
                 "No networks match your search"
+            } else if !state.online {
+                "Waiting for ZeroTier system service..."
+            } else {
+                "No networks found"
             },
             PAD_L,
             dp.ClipY + 12.0,
             state.content_w - PAD_L - EDGE_W,
-            0.4,
-            0.4,
-            0.4,
+            palette.muted,
         );
         libui::uiFreeFontDescriptor(&mut font);
         return;
@@ -457,13 +615,13 @@ unsafe extern "C" fn area_draw(
         // clearly stand out from the "(not connected)" entries, which keep
         // the alternate row shading.
         if row.joined {
-            fill_rect(ctx, 0.0, y, state.content_w, ROW_H, 0.88, 0.97, 0.89, 1.0);
+            fill_rect(ctx, 0.0, y, state.content_w, ROW_H, palette.joined);
         } else if i % 2 == 0 {
-            fill_rect(ctx, 0.0, y, state.content_w, ROW_H, 0.95, 0.95, 0.95, 1.0);
+            fill_rect(ctx, 0.0, y, state.content_w, ROW_H, palette.stripe);
         }
 
         // Separator line.
-        fill_rect(ctx, 0.0, y + ROW_H - 1.0, state.content_w, 1.0, 0.88, 0.88, 0.88, 1.0);
+        fill_rect(ctx, 0.0, y + ROW_H - 1.0, state.content_w, 1.0, palette.separator);
 
         // Main text.
         let label = row_label(row);
@@ -474,9 +632,7 @@ unsafe extern "C" fn area_draw(
             PAD_L,
             y + ROW_H / 2.0,
             text_region_w,
-            0.0,
-            0.0,
-            0.0,
+            palette.text,
         );
 
         // Action buttons (right-aligned text, one cell each). A reconnecting
@@ -498,9 +654,7 @@ unsafe extern "C" fn area_draw(
                 act,
                 cell_right - 4.0,
                 y + ROW_H / 2.0,
-                0.0,
-                0.45,
-                0.9,
+                palette.action,
             );
         }
     }
@@ -629,6 +783,7 @@ fn try_rebuild(state: &mut State) -> bool {
         return false;
     };
     prune_connecting(&guard, &mut state.connecting);
+    state.online = guard.is_online();
     let rows = compute_rows(
         &guard,
         &state.search,
@@ -659,8 +814,26 @@ unsafe extern "C" fn on_sort_changed(c: *mut libui::uiCombobox, data: *mut c_voi
     state.rebuild_needed = true;
 }
 
+/// Keep the drawn content width matched to the actual viewport so the
+/// rightmost action column always fits (no horizontal overflow). The viewport
+/// also narrows without a window resize when a scrollbar appears, hence this
+/// also runs from the timer. Returns false if the viewport width is unknown
+/// on this platform.
+unsafe fn sync_content_width(state: &mut State) -> bool {
+    let vw = area_viewport_width(state.area);
+    if vw < 60.0 {
+        return false;
+    }
+    if (vw - state.content_w).abs() > 0.5 {
+        state.content_w = vw;
+        update_area(state);
+    }
+    true
+}
+
 unsafe extern "C" fn on_timer(data: *mut c_void) -> c_int {
     let state = &mut *(data as *mut State);
+    sync_content_width(state);
 
     // Apply queued row actions as soon as the service client lock is free.
     if !state.pending.is_empty() {
@@ -702,13 +875,7 @@ unsafe extern "C" fn on_content_size_changed(w: *mut libui::uiWindow, data: *mut
     let state = &mut *(data as *mut State);
     // Prefer the real viewport width (macOS). On other platforms fall back to
     // the window content width with a safety margin.
-    let vw = area_viewport_width(state.area);
-    if vw >= 60.0 {
-        if (vw - state.content_w).abs() > 0.5 {
-            state.content_w = vw;
-            update_area(state);
-        }
-    } else {
+    if !sync_content_width(state) {
         let mut cw: c_int = 0;
         let mut ch: c_int = 0;
         libui::uiWindowContentSize(w, &mut cw, &mut ch);
@@ -794,12 +961,10 @@ pub fn networks_main() {
         let ah_ptr = Box::into_raw(Box::new(ah));
 
         // Determine initial geometry.
-        let (geom_x, geom_y, geom_w, geom_h) = load_geometry().unwrap_or((
-            0.0,
-            0.0,
-            WINDOW_SIZE_X,
-            WINDOW_SIZE_Y,
-        ));
+        let geom = load_geometry();
+        let (geom_w, geom_h) = geom
+            .as_ref()
+            .map_or((WINDOW_SIZE_X, WINDOW_SIZE_Y), |g| (g.width, g.height));
         let content_w = (geom_w as f64 - 12.0).max(280.0);
 
         let area = libui::uiNewScrollingArea(ah_ptr, content_w as c_int, 60);
@@ -807,10 +972,12 @@ pub fn networks_main() {
 
         libui::uiWindowSetChild(main_window, vbox.cast());
 
-        // Restore content size and (on macOS) window position.
+        // Restore content size and window position. Without a saved position
+        // the window keeps libui's default placement.
         libui::uiWindowSetContentSize(main_window, geom_w, geom_h);
-        #[cfg(target_os = "macos")]
-        window_set_frame_origin(main_window, geom_x, geom_y);
+        if let Some((x, y)) = geom.and_then(|g| g.position) {
+            window_restore_position(main_window, x, y);
+        }
 
         let state = Box::new(State {
             client,
@@ -820,10 +987,11 @@ pub fn networks_main() {
             area,
             rows: Vec::new(),
             content_w,
-            content_h: 60,
+            area_size: (content_w as c_int, 60),
             pending: Vec::new(),
             rebuild_needed: true,
             connecting: HashMap::new(),
+            online: false,
         });
         let state_ptr = Box::into_raw(state);
         G_STATE = state_ptr;

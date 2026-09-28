@@ -1,9 +1,11 @@
+# Needs the constants from cross/local.ini (written by `. cross/env.sh arm64`),
+# passed as an earlier --cross-file.
 [binaries]
-c = '/Users/ea/llvm-mingw/bin/aarch64-w64-mingw32-clang'
-cpp = '/Users/ea/llvm-mingw/bin/aarch64-w64-mingw32-clang++'
-ar = '/Users/ea/llvm-mingw/bin/aarch64-w64-mingw32-ar'
-windres = '/Users/ea/llvm-mingw/bin/aarch64-w64-mingw32-windres'
-strip = '/Users/ea/llvm-mingw/bin/aarch64-w64-mingw32-strip'
+c = llvm_mingw_bin / 'aarch64-w64-mingw32-clang'
+cpp = llvm_mingw_bin / 'aarch64-w64-mingw32-clang++'
+ar = llvm_mingw_bin / 'aarch64-w64-mingw32-ar'
+windres = llvm_mingw_bin / 'aarch64-w64-mingw32-windres'
+strip = llvm_mingw_bin / 'aarch64-w64-mingw32-strip'
 
 [built-in options]
 cpp_args = ['-fms-extensions']
