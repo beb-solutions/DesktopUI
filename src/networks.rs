@@ -16,10 +16,26 @@ use crate::serviceclient::{ms_since_epoch, ServiceClient};
 const WINDOW_SIZE_X: c_int = 600;
 const WINDOW_SIZE_Y: c_int = 480;
 
-const ROW_H: f64 = 22.0;
-const PAD_L: f64 = 8.0;
-const BUTTON_W: f64 = 88.0;
-const EDGE_W: f64 = 8.0;
+const ROW_H: f64 = 36.0;
+const HEADER_H: f64 = 30.0;
+const DOT_X: f64 = 18.0;
+const DOT_R: f64 = 4.5;
+const TEXT_X: f64 = 32.0;
+const COL_GAP: f64 = 14.0;
+const BUTTON_H: f64 = 24.0;
+const BUTTON_GAP: f64 = 6.0;
+const BUTTON_RADIUS: f64 = 6.0;
+const BUTTON_WIDTHS: [f64; 2] = [72.0, 96.0];
+const EDGE_W: f64 = 12.0;
+/// How long a Copy button reads "Copied" after a click.
+const COPIED_MS: i64 = 1_500;
+
+#[cfg(target_os = "macos")]
+const MONO_FAMILY: &str = "Menlo";
+#[cfg(windows)]
+const MONO_FAMILY: &str = "Consolas";
+#[cfg(not(any(target_os = "macos", windows)))]
+const MONO_FAMILY: &str = "Monospace";
 
 /// How long a reconnecting network is shown as "(connecting...)" before it
 /// falls back to whatever status the service reports. Guards against a join
@@ -54,37 +70,60 @@ unsafe impl objc2::Encode for NSSize {
         objc2::Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
 }
 
+type Rgb = (f64, f64, f64);
+
 /// Colors for the network list, since libui drawing has no notion of the
 /// system theme.
 struct Palette {
-    background: (f64, f64, f64),
-    stripe: (f64, f64, f64),
-    joined: (f64, f64, f64),
-    separator: (f64, f64, f64),
-    text: (f64, f64, f64),
-    muted: (f64, f64, f64),
-    action: (f64, f64, f64),
+    background: Rgb,
+    row_hover: Rgb,
+    separator: Rgb,
+    text: Rgb,
+    muted: Rgb,
+    header: Rgb,
+    action: Rgb,
+    danger: Rgb,
+    button: Rgb,
+    button_hover: Rgb,
+    status_ok: Rgb,
+    status_pending: Rgb,
+    status_error: Rgb,
+    status_idle: Rgb,
 }
 
 const LIGHT_PALETTE: Palette = Palette {
     background: (1.0, 1.0, 1.0),
-    stripe: (0.95, 0.95, 0.95),
-    joined: (0.88, 0.97, 0.89),
-    separator: (0.88, 0.88, 0.88),
-    text: (0.0, 0.0, 0.0),
-    muted: (0.4, 0.4, 0.4),
+    row_hover: (0.96, 0.96, 0.97),
+    separator: (0.91, 0.91, 0.92),
+    text: (0.1, 0.1, 0.12),
+    muted: (0.45, 0.45, 0.48),
+    header: (0.5, 0.5, 0.53),
     action: (0.0, 0.45, 0.9),
+    danger: (0.8, 0.2, 0.2),
+    button: (0.94, 0.94, 0.95),
+    button_hover: (0.87, 0.87, 0.89),
+    status_ok: (0.2, 0.72, 0.35),
+    status_pending: (0.93, 0.6, 0.1),
+    status_error: (0.85, 0.25, 0.25),
+    status_idle: (0.74, 0.74, 0.77),
 };
 
 #[cfg(target_os = "macos")]
 const DARK_PALETTE: Palette = Palette {
-    background: (0.12, 0.12, 0.12),
-    stripe: (0.16, 0.16, 0.16),
-    joined: (0.12, 0.26, 0.15),
-    separator: (0.24, 0.24, 0.24),
-    text: (0.92, 0.92, 0.92),
-    muted: (0.6, 0.6, 0.6),
-    action: (0.3, 0.62, 1.0),
+    background: (0.12, 0.12, 0.13),
+    row_hover: (0.17, 0.17, 0.18),
+    separator: (0.2, 0.2, 0.21),
+    text: (0.93, 0.93, 0.94),
+    muted: (0.6, 0.6, 0.63),
+    header: (0.55, 0.55, 0.58),
+    action: (0.38, 0.66, 1.0),
+    danger: (1.0, 0.45, 0.45),
+    button: (0.2, 0.2, 0.21),
+    button_hover: (0.28, 0.28, 0.3),
+    status_ok: (0.3, 0.82, 0.45),
+    status_pending: (1.0, 0.7, 0.2),
+    status_error: (1.0, 0.4, 0.4),
+    status_idle: (0.42, 0.42, 0.45),
 };
 
 /// Palette for the appearance the area is currently being drawn in. Only
@@ -156,6 +195,104 @@ struct State {
     connecting: HashMap<String, (String, i64)>,
     /// Whether the service answered the last sync; drives the empty-list hint.
     online: bool,
+    /// Vertical layout of the list (section headers and rows), rebuilt with
+    /// the rows and shared by drawing and hit testing.
+    lines: Vec<Line>,
+    /// Row index under the mouse, and which of its buttons (if any).
+    hover: Option<(usize, Option<usize>)>,
+    /// Network ID whose Copy button was clicked, and when.
+    copied: Option<(String, i64)>,
+    /// Fitted row texts for the current rows and width. Measuring and
+    /// shortening text is by far the most expensive part of drawing, so it is
+    /// done once here instead of on every redraw (e.g. each hover change).
+    text_cache: Option<TextCache>,
+}
+
+struct TextCache {
+    content_w: f64,
+    id_w: f64,
+    rows: Vec<RowText>,
+}
+
+struct RowText {
+    name: String,
+    /// Shown in the muted style (placeholder for a network without a name).
+    name_placeholder: bool,
+    name_w: f64,
+    show_id: bool,
+    status: String,
+}
+
+enum LineKind {
+    Header { title: &'static str, count: usize },
+    Row(usize),
+}
+
+struct Line {
+    y: f64,
+    h: f64,
+    kind: LineKind,
+}
+
+fn layout_lines(rows: &[Row]) -> Vec<Line> {
+    let mut lines = Vec::new();
+    let mut y = 0.0;
+    let joined = rows.iter().filter(|r| r.joined).count();
+    for (i, r) in rows.iter().enumerate() {
+        if i == 0 || r.joined != rows[i - 1].joined {
+            let (title, count) = if r.joined {
+                ("CONNECTED", joined)
+            } else {
+                ("SAVED", rows.len() - joined)
+            };
+            lines.push(Line {
+                y,
+                h: HEADER_H,
+                kind: LineKind::Header { title, count },
+            });
+            y += HEADER_H;
+        }
+        lines.push(Line {
+            y,
+            h: ROW_H,
+            kind: LineKind::Row(i),
+        });
+        y += ROW_H;
+    }
+    lines
+}
+
+/// Horizontal extents (x, width) of the two buttons at the end of a row.
+fn button_rects(content_w: f64) -> [(f64, f64); 2] {
+    let right = content_w - EDGE_W;
+    let x1 = right - BUTTON_WIDTHS[1];
+    let x0 = x1 - BUTTON_GAP - BUTTON_WIDTHS[0];
+    [(x0, BUTTON_WIDTHS[0]), (x1, BUTTON_WIDTHS[1])]
+}
+
+/// What the status column says for a service status, and the dot color.
+fn status_display<'a>(status: &str, palette: &'a Palette) -> (String, &'a Rgb) {
+    match status {
+        "OK" => ("Connected".into(), &palette.status_ok),
+        "(not connected)" => ("Not connected".into(), &palette.status_idle),
+        "(connecting...)" => ("Connecting…".into(), &palette.status_pending),
+        "REQUESTING_CONFIGURATION" => ("Requesting configuration…".into(), &palette.status_pending),
+        "AUTHENTICATION_REQUIRED" => ("Authentication required".into(), &palette.status_pending),
+        "ACCESS_DENIED" => ("Access denied".into(), &palette.status_error),
+        "NOT_FOUND" => ("Network not found".into(), &palette.status_error),
+        "PORT_ERROR" => ("Port error".into(), &palette.status_error),
+        "CLIENT_TOO_OLD" => ("Client too old".into(), &palette.status_error),
+        "" => ("Unknown".into(), &palette.status_idle),
+        other => {
+            // Unknown future statuses: FOO_BAR -> "Foo bar".
+            let mut t = other.replace('_', " ").to_lowercase();
+            if let Some(c) = t.get(0..1) {
+                let upper = c.to_uppercase();
+                t.replace_range(0..1, &upper);
+            }
+            (t, &palette.status_error)
+        }
+    }
 }
 
 static mut G_STATE: *mut State = null_mut();
@@ -434,30 +571,13 @@ fn compute_rows(
     rows
 }
 
-fn truncate_name(name: &str, max_chars: usize) -> String {
-    let mut out: String = name.chars().take(max_chars).collect();
-    if name.chars().count() > max_chars {
-        out.push('…');
-    }
-    out
-}
-
-fn row_label(r: &Row) -> String {
-    let nm = if r.name.is_empty() {
-        String::new()
-    } else {
-        truncate_name(&r.name, 40)
-    };
-    if nm.is_empty() {
-        format!("{}   [{}]", r.id, r.status)
-    } else {
-        format!("{}   {}   [{}]", nm, r.id, r.status)
-    }
-}
-
 fn update_area(state: &mut State) {
-    let nrows = state.rows.len() as i32;
-    let h = if nrows == 0 { 60 } else { nrows * (ROW_H as i32) };
+    state.lines = layout_lines(&state.rows);
+    state.text_cache = None;
+    let h = state
+        .lines
+        .last()
+        .map_or(60, |l| (l.y + l.h).ceil() as c_int + 8);
     let size = (state.content_w as c_int, h);
     if state.area_size != size {
         state.area_size = size;
@@ -476,22 +596,51 @@ unsafe fn load_font() -> libui::uiFontDescriptor {
     d
 }
 
+#[derive(Clone, Copy)]
+struct TextStyle<'a> {
+    color: &'a Rgb,
+    weight: libui::uiTextWeight,
+    mono: bool,
+    /// Offset from the control font size in points.
+    size_delta: f64,
+}
+
+impl<'a> TextStyle<'a> {
+    fn plain(color: &'a Rgb) -> Self {
+        TextStyle {
+            color,
+            weight: libui::uiTextWeightNormal,
+            mono: false,
+            size_delta: 0.0,
+        }
+    }
+}
+
 unsafe fn make_layout(
     font: &libui::uiFontDescriptor,
     text: &str,
     width: f64,
-    r: f64,
-    g: f64,
-    b: f64,
+    style: TextStyle,
 ) -> (*mut libui::uiDrawTextLayout, *mut libui::uiAttributedString) {
     // Network names come from the controller and may contain NUL, which a
     // C string cannot hold; drop it rather than failing.
     let c = CString::new(text.replace('\0', "")).unwrap();
     let s = libui::uiNewAttributedString(c.as_ptr());
     let len = c.as_bytes().len();
-    let attr = libui::uiNewColorAttribute(r, g, b, 1.0);
-    // The attributed string takes ownership of the attribute.
-    libui::uiAttributedStringSetAttribute(s, attr, 0, len);
+    // The attributed string takes ownership of the attributes.
+    let (r, g, b) = *style.color;
+    libui::uiAttributedStringSetAttribute(s, libui::uiNewColorAttribute(r, g, b, 1.0), 0, len);
+    if style.weight != libui::uiTextWeightNormal {
+        libui::uiAttributedStringSetAttribute(s, libui::uiNewWeightAttribute(style.weight), 0, len);
+    }
+    if style.mono {
+        let family = CString::new(MONO_FAMILY).unwrap();
+        libui::uiAttributedStringSetAttribute(s, libui::uiNewFamilyAttribute(family.as_ptr()), 0, len);
+    }
+    if style.size_delta != 0.0 {
+        let size = (font.Size + style.size_delta).max(6.0);
+        libui::uiAttributedStringSetAttribute(s, libui::uiNewSizeAttribute(size), 0, len);
+    }
     let mut p: libui::uiDrawTextLayoutParams = zeroed();
     p.String = s;
     p.DefaultFont = font as *const _ as *mut _;
@@ -502,16 +651,43 @@ unsafe fn make_layout(
     (tl, s)
 }
 
-unsafe fn fill_rect(
-    ctx: *mut libui::uiDrawContext,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-    (r, g, b): (f64, f64, f64),
-) {
-    let path = libui::uiDrawNewPath(libui::uiDrawFillModeWinding);
-    libui::uiDrawPathAddRectangle(path, x, y, w, h);
+unsafe fn text_size(font: &libui::uiFontDescriptor, text: &str, style: TextStyle) -> (f64, f64) {
+    let (tl, s) = make_layout(font, text, 10_000.0, style);
+    let mut w: f64 = 0.0;
+    let mut h: f64 = 0.0;
+    libui::uiDrawTextLayoutExtents(tl, &mut w, &mut h);
+    libui::uiDrawFreeTextLayout(tl);
+    libui::uiFreeAttributedString(s);
+    (w, h)
+}
+
+/// Shorten text with an ellipsis until it fits into max_w on one line.
+unsafe fn fit_text(font: &libui::uiFontDescriptor, text: &str, style: TextStyle, max_w: f64) -> String {
+    if max_w <= 0.0 {
+        return String::new();
+    }
+    if text_size(font, text, style).0 <= max_w {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let candidate: String = chars[..mid].iter().collect::<String>() + "…";
+        if text_size(font, &candidate, style).0 <= max_w {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if lo == 0 {
+        String::new()
+    } else {
+        chars[..lo].iter().collect::<String>().trim_end().to_string() + "…"
+    }
+}
+
+unsafe fn fill_path(ctx: *mut libui::uiDrawContext, path: *mut libui::uiDrawPath, (r, g, b): Rgb) {
     libui::uiDrawPathEnd(path);
     let mut brush: libui::uiDrawBrush = zeroed();
     brush.Type = libui::uiDrawBrushTypeSolid;
@@ -523,41 +699,258 @@ unsafe fn fill_rect(
     libui::uiDrawFreePath(path);
 }
 
+unsafe fn fill_rect(ctx: *mut libui::uiDrawContext, x: f64, y: f64, w: f64, h: f64, color: Rgb) {
+    let path = libui::uiDrawNewPath(libui::uiDrawFillModeWinding);
+    libui::uiDrawPathAddRectangle(path, x, y, w, h);
+    fill_path(ctx, path, color);
+}
+
+unsafe fn add_circle(path: *mut libui::uiDrawPath, cx: f64, cy: f64, r: f64) {
+    libui::uiDrawPathNewFigureWithArc(path, cx, cy, r, 0.0, 2.0 * std::f64::consts::PI, 0);
+    libui::uiDrawPathCloseFigure(path);
+}
+
+unsafe fn fill_circle(ctx: *mut libui::uiDrawContext, cx: f64, cy: f64, r: f64, color: Rgb) {
+    let path = libui::uiDrawNewPath(libui::uiDrawFillModeWinding);
+    add_circle(path, cx, cy, r);
+    fill_path(ctx, path, color);
+}
+
+/// Rounded rectangle built from two rectangles and four corner circles, which
+/// the winding fill merges into one shape.
+unsafe fn fill_rounded_rect(
+    ctx: *mut libui::uiDrawContext,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    r: f64,
+    color: Rgb,
+) {
+    let r = r.min(w / 2.0).min(h / 2.0);
+    let path = libui::uiDrawNewPath(libui::uiDrawFillModeWinding);
+    libui::uiDrawPathAddRectangle(path, x + r, y, w - 2.0 * r, h);
+    libui::uiDrawPathAddRectangle(path, x, y + r, w, h - 2.0 * r);
+    add_circle(path, x + r, y + r, r);
+    add_circle(path, x + w - r, y + r, r);
+    add_circle(path, x + r, y + h - r, r);
+    add_circle(path, x + w - r, y + h - r, r);
+    fill_path(ctx, path, color);
+}
+
+/// A text layout kept across frames. Building a layout (font matching and
+/// typesetting) costs about a millisecond, which added up to >100 ms per
+/// frame and made hover highlighting lag; drawing an existing one is cheap.
+struct CachedLayout {
+    layout: *mut libui::uiDrawTextLayout,
+    /// The layout references the attributed string, so it lives as long.
+    string: *mut libui::uiAttributedString,
+    w: f64,
+    h: f64,
+}
+
+/// Everything that goes into a layout: text plus the style bits, colors
+/// included since they are baked into the attributed string.
+type LayoutKey = (String, i32, bool, u64, [u64; 3]);
+
+/// Upper bound for the layout cache. Entries only pile up when texts change
+/// (renames, "Copied" flips, theme switches), so a full flush is enough.
+const LAYOUT_CACHE_MAX: usize = 512;
+
+/// Only touched from the UI thread, like G_STATE.
+static mut LAYOUT_CACHE: Option<HashMap<LayoutKey, CachedLayout>> = None;
+
+unsafe fn flush_layout_cache() {
+    if let Some(cache) = (*std::ptr::addr_of_mut!(LAYOUT_CACHE)).take() {
+        for (_, c) in cache {
+            libui::uiDrawFreeTextLayout(c.layout);
+            libui::uiFreeAttributedString(c.string);
+        }
+    }
+}
+
+unsafe fn cached_layout(
+    font: &libui::uiFontDescriptor,
+    text: &str,
+    style: TextStyle,
+) -> &'static CachedLayout {
+    let key: LayoutKey = (
+        text.to_string(),
+        style.weight as i32,
+        style.mono,
+        style.size_delta.to_bits(),
+        [style.color.0.to_bits(), style.color.1.to_bits(), style.color.2.to_bits()],
+    );
+    if (*std::ptr::addr_of!(LAYOUT_CACHE)).as_ref().is_some_and(|c| c.len() >= LAYOUT_CACHE_MAX) {
+        flush_layout_cache();
+    }
+    let cache = (*std::ptr::addr_of_mut!(LAYOUT_CACHE)).get_or_insert_with(HashMap::new);
+    cache.entry(key).or_insert_with(|| {
+        let (layout, string) = make_layout(font, text, 10_000.0, style);
+        let (mut w, mut h) = (0.0, 0.0);
+        libui::uiDrawTextLayoutExtents(layout, &mut w, &mut h);
+        CachedLayout { layout, string, w, h }
+    })
+}
+
 unsafe fn draw_text(
     ctx: *mut libui::uiDrawContext,
     font: &libui::uiFontDescriptor,
     text: &str,
     x: f64,
     y_center: f64,
-    max_w: f64,
-    (r, g, b): (f64, f64, f64),
-) {
-    let (tl, s) = make_layout(font, text, max_w.max(1.0), r, g, b);
-    let mut tw: f64 = 0.0;
-    let mut th: f64 = 0.0;
-    libui::uiDrawTextLayoutExtents(tl, &mut tw, &mut th);
-    let _ = tw;
-    let top = y_center - th / 2.0;
-    libui::uiDrawText(ctx, tl, x, top);
-    libui::uiDrawFreeTextLayout(tl);
-    libui::uiFreeAttributedString(s);
+    style: TextStyle,
+) -> f64 {
+    let l = cached_layout(font, text, style);
+    libui::uiDrawText(ctx, l.layout, x, y_center - l.h / 2.0);
+    l.w
 }
 
-unsafe fn draw_text_right(
+unsafe fn draw_text_centered(
     ctx: *mut libui::uiDrawContext,
     font: &libui::uiFontDescriptor,
     text: &str,
-    right_x: f64,
+    x_center: f64,
     y_center: f64,
-    (r, g, b): (f64, f64, f64),
+    style: TextStyle,
 ) {
-    let (tl, s) = make_layout(font, text, 4000.0, r, g, b);
-    let mut tw: f64 = 0.0;
-    let mut th: f64 = 0.0;
-    libui::uiDrawTextLayoutExtents(tl, &mut tw, &mut th);
-    libui::uiDrawText(ctx, tl, right_x - tw, y_center - th / 2.0);
-    libui::uiDrawFreeTextLayout(tl);
-    libui::uiFreeAttributedString(s);
+    let l = cached_layout(font, text, style);
+    libui::uiDrawText(ctx, l.layout, x_center - l.w / 2.0, y_center - l.h / 2.0);
+}
+
+fn name_style(palette: &Palette) -> TextStyle<'_> {
+    TextStyle {
+        weight: libui::uiTextWeightSemiBold,
+        ..TextStyle::plain(&palette.text)
+    }
+}
+
+fn id_style(palette: &Palette) -> TextStyle<'_> {
+    TextStyle {
+        mono: true,
+        size_delta: -1.0,
+        ..TextStyle::plain(&palette.muted)
+    }
+}
+
+/// Measure and shorten all row texts for the current width. Colors do not
+/// affect sizes, so the light palette is used for measuring.
+unsafe fn build_text_cache(font: &libui::uiFontDescriptor, state: &State) -> TextCache {
+    let palette = &LIGHT_PALETTE;
+    let buttons = button_rects(state.content_w);
+    let text_right = buttons[0].0 - COL_GAP;
+    let id_w = text_size(font, "0000000000000000", id_style(palette)).0;
+    let avail = text_right - TEXT_X;
+    let base_name_w = ((avail - id_w - 2.0 * COL_GAP) * 0.55).clamp(90.0, 280.0);
+    let show_id = TEXT_X + base_name_w + COL_GAP + id_w <= text_right;
+    // Too narrow for the ID column: give the name all the room.
+    let name_w = if show_id { base_name_w } else { avail };
+    let status_x = TEXT_X + name_w + COL_GAP + id_w + COL_GAP;
+
+    let rows = state
+        .rows
+        .iter()
+        .map(|row| {
+            let (name, style, placeholder) = if row.name.is_empty() {
+                ("Unnamed network", TextStyle::plain(&palette.muted), true)
+            } else {
+                (row.name.as_str(), name_style(palette), false)
+            };
+            let status = if show_id {
+                let (text, _) = status_display(&row.status, palette);
+                fit_text(font, &text, TextStyle::plain(&palette.muted), text_right - status_x)
+            } else {
+                String::new()
+            };
+            RowText {
+                name: fit_text(font, name, style, name_w),
+                name_placeholder: placeholder,
+                name_w,
+                show_id,
+                status,
+            }
+        })
+        .collect();
+    TextCache {
+        content_w: state.content_w,
+        id_w,
+        rows,
+    }
+}
+
+unsafe fn draw_row(
+    ctx: *mut libui::uiDrawContext,
+    font: &libui::uiFontDescriptor,
+    state: &State,
+    cache: &TextCache,
+    palette: &Palette,
+    index: usize,
+    y: f64,
+    last_in_section: bool,
+) {
+    let row = &state.rows[index];
+    let text = &cache.rows[index];
+    let cy = y + ROW_H / 2.0;
+    let hover = state.hover.filter(|(i, _)| *i == index);
+
+    if hover.is_some() {
+        fill_rect(ctx, 0.0, y, state.content_w, ROW_H, palette.row_hover);
+    }
+    if !last_in_section {
+        fill_rect(ctx, TEXT_X, y + ROW_H - 1.0, state.content_w - TEXT_X, 1.0, palette.separator);
+    }
+
+    let (_, dot) = status_display(&row.status, palette);
+    fill_circle(ctx, DOT_X, cy, DOT_R, *dot);
+
+    // Columns: name | ID | status, all left of the buttons.
+    let style = if text.name_placeholder {
+        TextStyle::plain(&palette.muted)
+    } else {
+        name_style(palette)
+    };
+    draw_text(ctx, font, &text.name, TEXT_X, cy, style);
+    if text.show_id {
+        let id_x = TEXT_X + text.name_w + COL_GAP;
+        draw_text(ctx, font, &row.id, id_x, cy, id_style(palette));
+        if !text.status.is_empty() {
+            let status_x = id_x + cache.id_w + COL_GAP;
+            draw_text(ctx, font, &text.status, status_x, cy, TextStyle::plain(&palette.muted));
+        }
+    }
+
+    // Buttons.
+    let buttons = button_rects(state.content_w);
+    let connecting = state.connecting.contains_key(&row.id);
+    let copied = state
+        .copied
+        .as_ref()
+        .is_some_and(|(id, _)| *id == row.id);
+    let labels: [(&str, &Rgb, bool); 2] = [
+        if copied {
+            ("Copied", &palette.status_ok, true)
+        } else {
+            ("Copy ID", &palette.text, true)
+        },
+        if connecting {
+            ("Connecting…", &palette.muted, false)
+        } else if row.joined {
+            ("Disconnect", &palette.danger, true)
+        } else {
+            ("Reconnect", &palette.action, true)
+        },
+    ];
+    let by = cy - BUTTON_H / 2.0;
+    for (j, ((bx, bw), (label, color, enabled))) in buttons.iter().zip(labels.iter()).enumerate() {
+        let hovered = *enabled && hover.is_some_and(|(_, b)| b == Some(j));
+        let bg = if hovered { palette.button_hover } else { palette.button };
+        fill_rounded_rect(ctx, *bx, by, *bw, BUTTON_H, BUTTON_RADIUS, bg);
+        let style = TextStyle {
+            size_delta: -1.0,
+            ..TextStyle::plain(color)
+        };
+        draw_text_centered(ctx, font, label, bx + bw / 2.0, cy, style);
+    }
 }
 
 unsafe extern "C" fn area_draw(
@@ -583,126 +976,121 @@ unsafe extern "C" fn area_draw(
     );
 
     if state.rows.is_empty() {
-        draw_text(
+        let hint = if !state.search.is_empty() {
+            "No networks match your search"
+        } else if !state.online {
+            "Waiting for ZeroTier system service..."
+        } else {
+            "No networks found"
+        };
+        draw_text_centered(
             ctx,
             &font,
-            if !state.search.is_empty() {
-                "No networks match your search"
-            } else if !state.online {
-                "Waiting for ZeroTier system service..."
-            } else {
-                "No networks found"
-            },
-            PAD_L,
-            dp.ClipY + 12.0,
-            state.content_w - PAD_L - EDGE_W,
-            palette.muted,
+            hint,
+            state.content_w / 2.0,
+            30.0,
+            TextStyle::plain(&palette.muted),
         );
         libui::uiFreeFontDescriptor(&mut font);
         return;
     }
 
-    let first = (dp.ClipY / ROW_H).floor().max(0.0) as usize;
-    let last = (((dp.ClipY + dp.ClipHeight) / ROW_H).ceil() as usize).min(state.rows.len());
+    if state
+        .text_cache
+        .as_ref()
+        .is_none_or(|c| c.content_w != state.content_w)
+    {
+        state.text_cache = Some(build_text_cache(&font, state));
+    }
+    let state = &*state;
+    let cache = state.text_cache.as_ref().unwrap();
 
-    let text_region_w = state.content_w - PAD_L - EDGE_W - 2.0 * BUTTON_W;
-
-    for i in first..last {
-        let row = &state.rows[i];
-        let y = i as f64 * ROW_H;
-
-        // Currently connected networks get a light green background so they
-        // clearly stand out from the "(not connected)" entries, which keep
-        // the alternate row shading.
-        if row.joined {
-            fill_rect(ctx, 0.0, y, state.content_w, ROW_H, palette.joined);
-        } else if i % 2 == 0 {
-            fill_rect(ctx, 0.0, y, state.content_w, ROW_H, palette.stripe);
+    let clip_top = dp.ClipY;
+    let clip_bottom = dp.ClipY + dp.ClipHeight;
+    for (n, line) in state.lines.iter().enumerate() {
+        if line.y + line.h < clip_top || line.y > clip_bottom {
+            continue;
         }
-
-        // Separator line.
-        fill_rect(ctx, 0.0, y + ROW_H - 1.0, state.content_w, 1.0, palette.separator);
-
-        // Main text.
-        let label = row_label(row);
-        draw_text(
-            ctx,
-            &font,
-            &label,
-            PAD_L,
-            y + ROW_H / 2.0,
-            text_region_w,
-            palette.text,
-        );
-
-        // Action buttons (right-aligned text, one cell each). A reconnecting
-        // entry has no usable action yet (the status column already reads
-        // "(connecting...)"), so its second cell is just a busy indicator and
-        // clicks there are ignored in the mouse handler.
-        let actions: [&str; 2] = if state.connecting.contains_key(&row.id) {
-            ["Copy", "…"]
-        } else if row.joined {
-            ["Copy", "Disconnect"]
-        } else {
-            ["Copy", "Reconnect"]
-        };
-        for (j, act) in actions.iter().enumerate() {
-            let cell_right = state.content_w - EDGE_W - (actions.len() - 1 - j) as f64 * BUTTON_W;
-            draw_text_right(
-                ctx,
-                &font,
-                act,
-                cell_right - 4.0,
-                y + ROW_H / 2.0,
-                palette.action,
-            );
+        match line.kind {
+            LineKind::Header { title, count } => {
+                let style = TextStyle {
+                    weight: libui::uiTextWeightSemiBold,
+                    size_delta: -2.0,
+                    ..TextStyle::plain(&palette.header)
+                };
+                let cy = line.y + line.h * 0.6;
+                let w = draw_text(ctx, &font, title, DOT_X - DOT_R, cy, style);
+                let count_style = TextStyle {
+                    weight: libui::uiTextWeightNormal,
+                    ..style
+                };
+                draw_text(ctx, &font, &count.to_string(), DOT_X - DOT_R + w + 6.0, cy, count_style);
+            }
+            LineKind::Row(index) => {
+                let last_in_section = !matches!(
+                    state.lines.get(n + 1).map(|l| &l.kind),
+                    Some(LineKind::Row(_))
+                );
+                draw_row(ctx, &font, state, cache, palette, index, line.y, last_in_section);
+            }
         }
     }
 
     libui::uiFreeFontDescriptor(&mut font);
 }
 
+/// Row and button (0 = copy, 1 = connect action) at a point in the area.
+fn hit_test(state: &State, x: f64, y: f64) -> Option<(usize, Option<usize>)> {
+    let line = state.lines.iter().find(|l| y >= l.y && y < l.y + l.h)?;
+    let LineKind::Row(index) = line.kind else {
+        return None;
+    };
+    let cy = line.y + ROW_H / 2.0;
+    let button = button_rects(state.content_w)
+        .iter()
+        .position(|(bx, bw)| {
+            x >= *bx && x < bx + bw && (y - cy).abs() <= BUTTON_H / 2.0
+        });
+    Some((index, button))
+}
+
 unsafe extern "C" fn area_mouse(
     _ah: *mut libui::uiAreaHandler,
-    _area: *mut libui::uiArea,
+    area: *mut libui::uiArea,
     me: *mut libui::uiAreaMouseEvent,
 ) {
     let state = &mut *G_STATE;
     let me = &*me;
-    if me.Down != 1 || me.Y < 0.0 {
-        return;
-    }
-    let idx = (me.Y / ROW_H) as usize;
-    if idx >= state.rows.len() {
-        return;
-    }
-    let x = me.X;
-    let x0 = state.content_w - EDGE_W - 2.0 * BUTTON_W;
-    let col = if x >= x0 && x < x0 + BUTTON_W {
-        Some(0)
-    } else if x >= x0 + BUTTON_W && x <= state.content_w - EDGE_W {
-        Some(1)
-    } else {
-        None
-    };
-    let col = match col {
-        Some(c) => c,
-        None => return,
-    };
 
+    let hit = hit_test(state, me.X, me.Y);
+    if me.Down == 0 {
+        if hit != state.hover {
+            state.hover = hit;
+            libui::uiAreaQueueRedrawAll(area);
+        }
+        return;
+    }
+    if me.Down != 1 {
+        return;
+    }
+    let Some((idx, Some(button))) = hit else {
+        return;
+    };
     let row = state.rows[idx].clone();
 
-    // col 0 is always "Copy"; col 1 is Disconnect/Reconnect. Row actions are
-    // queued and applied from the timer tick so this handler never blocks the
-    // UI thread on the service client lock (the background sync thread may
-    // hold it for a while). No notifications are shown from this window: the
-    // row list itself provides the feedback.
-    if col == 0 {
+    // Button 0 copies the ID; button 1 is Disconnect/Reconnect. Row actions
+    // are queued and applied from the timer tick so this handler never blocks
+    // the UI thread on the service client lock (the background sync thread
+    // may hold it for a while). No notifications are shown from this window:
+    // the row list itself provides the feedback.
+    if button == 0 {
         crate::copy_to_clipboard(row.id.as_str());
+        state.copied = Some((row.id, ms_since_epoch()));
+        libui::uiAreaQueueRedrawAll(area);
         return;
     }
     // While a reconnect is in progress the entry is shown as connecting;
-    // further clicks on the action column are ignored.
+    // further clicks on the action button are ignored.
     if state.connecting.contains_key(&row.id) {
         return;
     }
@@ -714,7 +1102,7 @@ unsafe extern "C" fn area_mouse(
         });
     } else {
         // Remember that this network is being reconnected so the row keeps
-        // showing its name with a "(connecting...)" status until the service
+        // showing its name with a "Connecting…" status until the service
         // reports the new state.
         state.connecting.insert(
             row.id.clone(),
@@ -730,9 +1118,14 @@ unsafe extern "C" fn area_mouse(
 
 unsafe extern "C" fn area_mouse_crossed(
     _ah: *mut libui::uiAreaHandler,
-    _area: *mut libui::uiArea,
-    _left: c_int,
+    area: *mut libui::uiArea,
+    left: c_int,
 ) {
+    let state = &mut *G_STATE;
+    if left != 0 && state.hover.is_some() {
+        state.hover = None;
+        libui::uiAreaQueueRedrawAll(area);
+    }
 }
 
 unsafe extern "C" fn area_drag_broken(_ah: *mut libui::uiAreaHandler, _area: *mut libui::uiArea) {}
@@ -835,6 +1228,15 @@ unsafe extern "C" fn on_timer(data: *mut c_void) -> c_int {
     let state = &mut *(data as *mut State);
     sync_content_width(state);
 
+    if state
+        .copied
+        .as_ref()
+        .is_some_and(|(_, t)| ms_since_epoch() - t > COPIED_MS)
+    {
+        state.copied = None;
+        libui::uiAreaQueueRedrawAll(state.area);
+    }
+
     // Apply queued row actions as soon as the service client lock is free.
     if !state.pending.is_empty() {
         if let Some(mut guard) = state.client.try_lock() {
@@ -925,28 +1327,19 @@ pub fn networks_main() {
         let vbox = libui::uiNewVerticalBox();
         libui::uiBoxSetPadded(vbox, 1);
 
-        let search_row = libui::uiNewHorizontalBox();
-        libui::uiBoxSetPadded(search_row, 1);
-        let search_label_text = CString::new("Search:").unwrap();
-        let search_label = libui::uiNewLabel(search_label_text.as_ptr());
-        libui::uiBoxAppend(search_row, search_label.cast(), 0);
+        // Toolbar: search field stretching over the width, sort order on the right.
+        let toolbar = libui::uiNewHorizontalBox();
+        libui::uiBoxSetPadded(toolbar, 1);
         let search_entry = libui::uiNewSearchEntry();
-        libui::uiBoxAppend(search_row, search_entry.cast(), 1);
-        libui::uiBoxAppend(vbox, search_row.cast(), 0);
-
-        let sort_row = libui::uiNewHorizontalBox();
-        libui::uiBoxSetPadded(sort_row, 1);
-        let sort_label_text = CString::new("Sort:").unwrap();
-        let sort_label = libui::uiNewLabel(sort_label_text.as_ptr());
-        libui::uiBoxAppend(sort_row, sort_label.cast(), 0);
+        libui::uiBoxAppend(toolbar, search_entry.cast(), 1);
         let sort_combo = libui::uiNewCombobox();
         let by_id = CString::new("Sort by ID").unwrap();
         let by_name = CString::new("Sort by Name").unwrap();
         libui::uiComboboxAppend(sort_combo, by_id.as_ptr());
         libui::uiComboboxAppend(sort_combo, by_name.as_ptr());
         libui::uiComboboxSetSelected(sort_combo, 1); // default: sort by name
-        libui::uiBoxAppend(sort_row, sort_combo.cast(), 0);
-        libui::uiBoxAppend(vbox, sort_row.cast(), 0);
+        libui::uiBoxAppend(toolbar, sort_combo.cast(), 0);
+        libui::uiBoxAppend(vbox, toolbar.cast(), 0);
 
         let (client, dirty_flag) = crate::start_client_async(vec!["status", "network"], 250, 4);
 
@@ -992,6 +1385,10 @@ pub fn networks_main() {
             rebuild_needed: true,
             connecting: HashMap::new(),
             online: false,
+            lines: Vec::new(),
+            hover: None,
+            copied: None,
+            text_cache: None,
         });
         let state_ptr = Box::into_raw(state);
         G_STATE = state_ptr;
