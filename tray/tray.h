@@ -28,6 +28,10 @@ struct tray_menu
 
 void tray_update(struct tray *tray);
 
+/* Make a blocking tray_loop() return as soon as possible. Safe to call from
+ * any thread. */
+void tray_wake(void);
+
 #if defined(TRAY_APPINDICATOR)
 
 #include <gtk/gtk.h>
@@ -95,10 +99,27 @@ void tray_update(struct tray *tray) {
 
 void tray_exit() { loop_result = -1; }
 
+/* Runs on the GTK main loop; only exists so gtk_main_iteration_do() returns. */
+static gboolean _tray_wake_cb(gpointer data) {
+  (void)data;
+  return G_SOURCE_REMOVE;
+}
+
+/* g_idle_add() is thread safe and wakes up the default main context. */
+void tray_wake(void) { g_idle_add(_tray_wake_cb, NULL); }
+
 #elif defined(TRAY_APPKIT)
 
 #include <objc/objc-runtime.h>
+#include <dispatch/dispatch.h>
 #include <limits.h>
+
+/* Same layout as CGPoint/NSPoint (two doubles), which is not declared by the
+ * headers included here. */
+typedef struct { double x; double y; } tray_point;
+
+/* NSEventTypeApplicationDefined */
+#define TRAY_NS_EVENT_TYPE_APPLICATION_DEFINED 15UL
 
 static id app = NULL;
 static id statusBar = NULL;
@@ -118,8 +139,9 @@ static id _tray_menu(struct tray_menu *m, id menu) {
 
     for (; m != NULL && m->text != NULL; m++) {
         if (strcmp(m->text, "-") == 0) {
+            /* separatorItem already returns an autoreleased object; releasing
+             * it once more would free it while the menu still holds it. */
             id menuItem = ((id(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSMenuItem"), sel_registerName("separatorItem"));
-            menuItem = ((id(*)(id, SEL))objc_msgSend)(menuItem, sel_registerName("autorelease"));
             ((void(*)(id, SEL, id))objc_msgSend)(menu, sel_registerName("addItem:"), menuItem);
         } else {
             id menuItem = ((id(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSMenuItem"), sel_registerName("alloc"));
@@ -154,6 +176,9 @@ static void menu_callback(id self, SEL cmd, id sender) {
 
 int tray_init(struct tray *tray) {
     kCFRunLoopDefaultMode = ((id(*)(id, SEL, char*))objc_msgSend)((id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), "kCFRunLoopDefaultMode");
+    /* stringWithUTF8String: returns an autoreleased object; keep our own
+     * reference since it lives in a static for the lifetime of the process. */
+    ((void(*)(id, SEL))objc_msgSend)(kCFRunLoopDefaultMode, sel_registerName("retain"));
 
     ((void(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
     Class trayDelegateClass = objc_allocateClassPair(objc_getClass("NSObject"), "Tray", 0);
@@ -197,13 +222,46 @@ int tray_loop(int blocking) {
 }
 
 void tray_update(struct tray *tray) {
+    /* tray_update() is called from outside tray_loop()'s pool, so without a
+     * pool of its own every autoreleased menu object built here would leak. */
+    id pool = ((id(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSAutoreleasePool"), sel_registerName("new"));
+
     if (tray->icon) {
         ((void(*)(id, SEL, id))objc_msgSend)(statusBarButton, sel_registerName("setImage:"), ((id(*)(id, SEL, id))objc_msgSend)((id)objc_getClass("NSImage"), sel_registerName("imageNamed:"), ((id(*)(id, SEL, char *))objc_msgSend)((id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), tray->icon)));
     }
     id wasMenuSet = rootMenu;
     rootMenu = _tray_menu(tray->menu, rootMenu);
-    if (!wasMenuSet)
+    if (!wasMenuSet) {
+      /* The root menu is created autoreleased; the static needs its own
+       * reference so it does not depend on setMenu: retaining it. */
+      ((void(*)(id, SEL))objc_msgSend)(rootMenu, sel_registerName("retain"));
       ((void(*)(id, SEL, id))objc_msgSend)(statusItem, sel_registerName("setMenu:"), rootMenu);
+    }
+
+    ((void(*)(id, SEL))objc_msgSend)(pool, sel_registerName("drain"));
+}
+
+/* Runs on the main thread. Posting an application-defined event makes a
+ * nextEventMatchingMask: call in tray_loop() return right away; the dispatch
+ * itself only wakes the run loop without ending that call. */
+static void _tray_wake_main(void *context) {
+    (void)context;
+    if (!app)
+        return;
+    id pool = ((id(*)(id, SEL))objc_msgSend)((id)objc_getClass("NSAutoreleasePool"), sel_registerName("new"));
+    tray_point location = { 0.0, 0.0 };
+    id event = ((id(*)(id, SEL, unsigned long, tray_point, unsigned long, double, long, id, short, long, long))objc_msgSend)(
+        (id)objc_getClass("NSEvent"),
+        sel_registerName("otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:data1:data2:"),
+        TRAY_NS_EVENT_TYPE_APPLICATION_DEFINED, location, 0UL, 0.0, 0L, (id)NULL, (short)0, 0L, 0L);
+    if (event) {
+        ((void(*)(id, SEL, id, bool))objc_msgSend)(app, sel_registerName("postEvent:atStart:"), event, false);
+    }
+    ((void(*)(id, SEL))objc_msgSend)(pool, sel_registerName("drain"));
+}
+
+void tray_wake(void) {
+    dispatch_async_f(dispatch_get_main_queue(), NULL, _tray_wake_main);
 }
 
 void tray_exit() {
@@ -381,6 +439,14 @@ void tray_exit() {
   PostQuitMessage(0);
   UnregisterClass(WC_TRAY_CLASS_NAME, GetModuleHandle(NULL));
 }
+
+/* PostMessage() may be called from any thread; GetMessage() in tray_loop()
+ * returns once the message arrives, and WM_NULL is ignored by the window. */
+void tray_wake(void) {
+  if (hwnd != NULL) {
+    PostMessage(hwnd, WM_NULL, 0, 0);
+  }
+}
 #else
 
 int tray_init(struct tray *tray)
@@ -393,6 +459,9 @@ void tray_update(struct tray *tray)
 {}
 
 void tray_exit();
+
+void tray_wake(void)
+{}
 
 #endif
 

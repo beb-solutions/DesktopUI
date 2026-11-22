@@ -362,12 +362,16 @@ fn notify(text: &str, _: Option<(String, String)>) {
 
 #[cfg(target_os = "macos")]
 fn notify(text: &str, _: Option<(String, String)>) {
-    let _ = mac_notification_sys::set_application(MAC_BUNDLE_ID);
-    let mut n = mac_notification_sys::Notification::new();
-    n.title("ZeroTier");
-    n.message(text);
-    n.asynchronous(true);
-    let _ = n.send();
+    // Also called from the tray main loop, which is outside any autorelease
+    // pool; without this every notification would leak its Cocoa objects.
+    objc2::rc::autoreleasepool(|_| {
+        let _ = mac_notification_sys::set_application(MAC_BUNDLE_ID);
+        let mut n = mac_notification_sys::Notification::new();
+        n.title("ZeroTier");
+        n.message(text);
+        n.asynchronous(true);
+        let _ = n.send();
+    });
     /*
     if let Some(url) = url {
         if let Ok(r) = mac_notification_sys::send_notification(
@@ -394,28 +398,34 @@ fn notify(text: &str, _: Option<(String, String)>) {
 
 /*******************************************************************************************************************/
 
-/// Start the service client background thread, returning the client and a flag set when the data changes.
+/// Called from the client's background thread whenever its data changed and
+/// the UI should pick it up.
+type OnDirty = Box<dyn Fn() + Send + 'static>;
+
+/// Start the service client background thread, returning the client and a flag
+/// set when the data changes.
+///
+/// The first sync runs on the background thread right after it starts, so the
+/// caller (always a UI thread) can show its tray menu or window immediately and
+/// the data appears once the sync completes. `allow_privilege_escalation`
+/// lets the client ask for elevated privileges to read the auth token; only
+/// the tray does that, a prompt popping up from a window is confusing.
+/// `on_dirty` is called at the end of every tick while the dirty flag is set.
 fn start_client(
     refresh_base_paths: Vec<&'static str>,
     tick_period_ms: u64,
     refresh_period_ticks: u64,
+    allow_privilege_escalation: bool,
+    on_dirty: Option<OnDirty>,
 ) -> (Arc<Mutex<ServiceClient>>, Arc<AtomicBool>) {
-    start_client_impl(refresh_base_paths, tick_period_ms, refresh_period_ticks, true)
-}
-
-/// Like [start_client], but never performs a blocking sync on the calling
-/// (UI) thread. The first sync runs on the background thread right after it
-/// starts, so the caller can build and show its window immediately and the
-/// data simply appears once the sync completes. Used by the networks window so
-/// it stays responsive (and doesn't delay its first paint) when the local
-/// service is slow to respond. It also never asks for elevated privileges to
-/// read the auth token; that prompt belongs to the tray.
-fn start_client_async(
-    refresh_base_paths: Vec<&'static str>,
-    tick_period_ms: u64,
-    refresh_period_ticks: u64,
-) -> (Arc<Mutex<ServiceClient>>, Arc<AtomicBool>) {
-    start_client_impl(refresh_base_paths, tick_period_ms, refresh_period_ticks, false)
+    start_client_impl(
+        refresh_base_paths,
+        tick_period_ms,
+        refresh_period_ticks,
+        false,
+        allow_privilege_escalation,
+        on_dirty,
+    )
 }
 
 fn start_client_impl(
@@ -423,22 +433,26 @@ fn start_client_impl(
     tick_period_ms: u64,
     refresh_period_ticks: u64,
     sync_on_caller_thread: bool,
+    allow_privilege_escalation: bool,
+    on_dirty: Option<OnDirty>,
 ) -> (Arc<Mutex<ServiceClient>>, Arc<AtomicBool>) {
     let (mut client, dirty_flag) = ServiceClient::new(refresh_base_paths);
+    if !allow_privilege_escalation {
+        client.disable_privilege_escalation();
+    }
     if sync_on_caller_thread {
         client.sync();
-    } else {
-        client.disable_privilege_escalation();
     }
 
     let client = Arc::new(Mutex::new(client));
 
     let thread_client = client.clone();
+    let thread_dirty_flag = dirty_flag.clone();
     let _ = std::thread::spawn(move || {
         set_thread_to_background_priority();
         if !sync_on_caller_thread {
-            // First sync happens off the UI thread so the window can be shown
-            // and stay interactive immediately.
+            // First sync happens off the UI thread so the tray menu or window
+            // can be shown and stay interactive immediately.
             thread_client.lock().sync();
         }
         let mut k = 0_u64;
@@ -454,6 +468,14 @@ fn start_client_impl(
                 if k >= refresh_period_ticks {
                     k = 0;
                     thread_client.lock().sync();
+                }
+            }
+            // Wake the UI as long as there is unseen data. Deliberately
+            // repeated every tick: the UI only try_locks the client, so if it
+            // found the lock busy it gets another chance on the next tick.
+            if let Some(on_dirty) = on_dirty.as_ref() {
+                if thread_dirty_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    on_dirty();
                 }
             }
             std::thread::sleep(Duration::from_millis(tick_period_ms));
@@ -493,11 +515,9 @@ fn tray_main() {
         std::process::exit(1);
     }
 
-    // On Apple Silicon Macs this tells the OS to use efficiency cores for the tray app. Perceptible performance is still great.
-    // Don't do it on Intel Macs because it seems to make stuff really slow with little power use benefit. For the genuine background
-    // threads we always do it because if those a bit slow it's fine.
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    set_thread_to_background_priority();
+    // A registry read, fast enough to do right here.
+    #[cfg(windows)]
+    refresh_windows_start_on_login();
 
     // Automatically populated with a path to the right icon for e.g. light/dark mode.
     let mut icon_name = tray_icon_name();
@@ -505,20 +525,78 @@ fn tray_main() {
     // Set to true from anywhere to cause app to exit on next event loop.
     let exit_flag = Arc::new(AtomicBool::new(false));
 
-    let (client, dirty_flag) = start_client(vec!["status", "network"], 250, 10);
+    let (client, dirty_flag) = start_client(
+        vec!["status", "network"],
+        250,
+        10,
+        true,
+        Some(Box::new(crate::tray::wake)),
+    );
+
+    // Querying login items runs osascript, which is slow (and may show a
+    // permission prompt), so do it off the main thread and refresh the menu
+    // checkmark once it is known.
+    #[cfg(target_os = "macos")]
+    {
+        let dirty_flag2 = dirty_flag.clone();
+        std::thread::spawn(move || {
+            refresh_mac_start_on_login();
+            dirty_flag2.store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::tray::wake();
+        });
+    }
     let about_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
     let networks_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
     let joining: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let join_window_open = Arc::new(AtomicBool::new(false));
     let sso_notification_shown: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
-    // This closure builds a new menu for display in the app icon.
-    let refresh = || {
-        let mut menu: Vec<TrayMenuItem> = Vec::new();
-        if client.lock().is_online() {
-            let address = client.lock().get_str(&["status", "address"]);
-            let version = client.lock().get_str(&["status", "version"]);
+    let quit_item = || {
+        let exit_flag2 = exit_flag.clone();
+        TrayMenuItem::Text {
+            text: "Quit ZeroTier UI ".into(),
+            checked: false,
+            disabled: false,
+            handler: Some(Box::new(move || {
+                exit_flag2.store(true, std::sync::atomic::Ordering::SeqCst)
+            })),
+        }
+    };
 
+    // Menu shown while the service is not reachable (or not queried yet).
+    let waiting_menu = || {
+        vec![
+            TrayMenuItem::Text {
+                text: "Waiting for ZeroTier system service...".into(),
+                checked: false,
+                disabled: true,
+                handler: None,
+            },
+            quit_item(),
+        ]
+    };
+
+    // This closure builds a new menu for display in the app icon. It returns
+    // None if the client is busy (the background thread holds its lock during
+    // HTTP calls), so the main thread never blocks on it.
+    let refresh = || -> Option<Vec<TrayMenuItem>> {
+        // Take everything needed from the client at once and release the lock.
+        let snapshot = {
+            let c = client.try_lock()?;
+            if c.is_online() {
+                Some((
+                    c.get_str(&["status", "address"]),
+                    c.get_str(&["status", "version"]),
+                    c.networks(),
+                    c.saved_networks(),
+                ))
+            } else {
+                None
+            }
+        };
+
+        let mut menu: Vec<TrayMenuItem> = Vec::new();
+        if let Some((address, version, networks, saved_networks)) = snapshot {
             let address2 = address.clone();
             menu.push(TrayMenuItem::Text {
                 text: format!("My Address:  {} ", address),
@@ -577,9 +655,33 @@ fn tray_main() {
                 disabled: false,
                 handler: Some(Box::new(move || {
                     let mut child = networks_child2.lock();
-                    if child.is_none() {
+                    // The main loop only reaps a closed window on its next
+                    // pass, which can be after this click; without checking
+                    // here, reopening right after closing did nothing.
+                    if child
+                        .as_mut()
+                        .is_some_and(|c| !matches!(c.try_wait(), Ok(None)))
+                    {
+                        let _ = child.take();
+                    }
+                    if let Some(c) = child.as_mut() {
+                        // Already open: ask it to come to the front. It reads
+                        // its stdin line by line. Errors (e.g. the window just
+                        // closed) are harmless.
+                        #[cfg(windows)]
+                        unsafe {
+                            // Let the child take the foreground; Windows only
+                            // allows that if the foreground process permits it.
+                            winapi::um::winuser::AllowSetForegroundWindow(c.id());
+                        }
+                        if let Some(stdin) = c.stdin.as_mut() {
+                            let _ = stdin.write_all(b"raise\n");
+                            let _ = stdin.flush();
+                        }
+                    } else {
                         let ch = Command::new(std::env::current_exe().unwrap())
                             .arg("networks")
+                            .stdin(Stdio::piped())
                             .spawn();
                         if ch.is_ok() {
                             let _ = child.insert(ch.unwrap());
@@ -593,7 +695,6 @@ fn tray_main() {
             let mut networks_empty = true;
             let mut login_needed_networks = Vec::new();
 
-            let networks = client.lock().networks();
             if !networks.is_empty() {
                 menu.push(TrayMenuItem::Separator);
                 for network in networks.iter() {
@@ -943,7 +1044,6 @@ fn tray_main() {
 
             menu.push(TrayMenuItem::Separator);
 
-            let saved_networks = client.lock().saved_networks();
             if !saved_networks.is_empty() {
                 let mut saved_networks_empty = true;
                 for nw in saved_networks.iter() {
@@ -1076,6 +1176,14 @@ fn tray_main() {
                 disabled: false,
                 handler: Some(Box::new(move || {
                     let mut child = about_child2.lock();
+                    // See "Show Networks...": the window may have been closed
+                    // since the main loop last reaped it.
+                    if child
+                        .as_mut()
+                        .is_some_and(|c| !matches!(c.try_wait(), Ok(None)))
+                    {
+                        let _ = child.take();
+                    }
                     if child.is_none() {
                         let ch = Command::new(std::env::current_exe().unwrap())
                             .arg("about")
@@ -1088,28 +1196,15 @@ fn tray_main() {
                 })),
             });
         } else {
-            menu.push(TrayMenuItem::Text {
-                text: "Waiting for ZeroTier system service...".into(),
-                checked: false,
-                disabled: true,
-                handler: None,
-            });
+            return Some(waiting_menu());
         }
 
-        let exit_flag2 = exit_flag.clone();
-        menu.push(TrayMenuItem::Text {
-            text: "Quit ZeroTier UI ".into(),
-            checked: false,
-            disabled: false,
-            handler: Some(Box::new(move || {
-                exit_flag2.store(true, std::sync::atomic::Ordering::SeqCst)
-            })),
-        });
+        menu.push(quit_item());
 
-        menu
+        Some(menu)
     };
 
-    let tray = Tray::init(icon_name.as_ref(), refresh());
+    let tray = Tray::init(icon_name.as_ref(), refresh().unwrap_or_else(waiting_menu));
 
     loop {
         // Reap subprocesses if finished. try_wait() returns Ok(None) while the
@@ -1125,32 +1220,41 @@ fn tray_main() {
             }
         }
 
-        // Check for authentication required networks and notify.
-        let auth_required_networks = client.lock().sso_auth_needed_networks();
+        // Check for authentication required networks and notify. Skipped
+        // while the client is busy; it is checked again on the next pass.
+        let auth_required_networks = client
+            .try_lock()
+            .map(|c| c.sso_auth_needed_networks())
+            .unwrap_or_default();
         for (nwid, auth_url, status) in auth_required_networks.iter() {
             if status == "AUTHENTICATION_REQUIRED"
                 && sso_notification_shown.lock().insert(nwid.clone())
             {
                 notify(
-                    format!("ZeroTier network {} requires SSO authentication. Select 'Open SSL Login URL' to proceed.", nwid).as_str(),
-                    Some(("Open SSL Login URL...".into(), auth_url.clone()))
+                    format!("ZeroTier network {} requires SSO authentication. Select 'Open SSO Login URL' to proceed.", nwid).as_str(),
+                    Some(("Open SSO Login URL...".into(), auth_url.clone()))
                 );
             }
         }
 
-        // Refresh menu if data has changed.
+        // Refresh menu if data has changed. If the client is busy, keep the
+        // flag set; the client thread wakes this loop again on its next tick.
         if dirty_flag.swap(false, std::sync::atomic::Ordering::Relaxed) {
-            let new_icon = tray_icon_name();
-            if new_icon != icon_name {
-                icon_name = new_icon;
-                tray.update(Some(icon_name.as_ref()), refresh());
+            if let Some(menu) = refresh() {
+                let new_icon = tray_icon_name();
+                if new_icon != icon_name {
+                    icon_name = new_icon;
+                    tray.update(Some(icon_name.as_ref()), menu);
+                } else {
+                    tray.update(None, menu);
+                }
             } else {
-                tray.update(None, refresh());
+                dirty_flag.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
-        // Execute next tray event loop, which will (as per modifications made to tray.h) return after a second or two if
-        // nothing happens. This allows periodic polling for changes to happen in this code.
+        // Execute next tray event loop. It returns when an event arrives, when the client thread calls tray::wake()
+        // after new data came in, or after at most MAX_WAIT_SECONDS (see tray.h) as a fallback.
         if !tray.poll() || exit_flag.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
@@ -1165,12 +1269,6 @@ fn tray_main() {
 /*******************************************************************************************************************/
 
 fn main() {
-    #[cfg(target_os = "macos")]
-    refresh_mac_start_on_login();
-
-    #[cfg(windows)]
-    refresh_windows_start_on_login();
-
     // Import old network list info from old Mac UI.
     #[cfg(target_os = "macos")]
     {
