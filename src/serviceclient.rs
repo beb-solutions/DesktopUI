@@ -51,6 +51,9 @@ pub struct ServiceClient {
     try_escalate_privs: isize,
     consecutive_auth_failures: u32,
     http_agent: Agent,
+    /// Set once the first sync() has finished, whether or not the service
+    /// answered. Until then the cached state says nothing about the service.
+    synced_once: bool,
 }
 
 pub fn ms_since_epoch() -> i64 {
@@ -277,6 +280,7 @@ impl ServiceClient {
                 try_escalate_privs: 2, // try this twice at startup, but not forever
                 consecutive_auth_failures: 0,
                 http_agent: Self::build_agent(),
+                synced_once: false,
             },
             dirty_flag,
         )
@@ -297,6 +301,12 @@ impl ServiceClient {
     #[inline(always)]
     pub fn is_online(&self) -> bool {
         self.is_initialized() && self.online
+    }
+
+    /// Whether at least one sync() has completed.
+    #[inline(always)]
+    pub fn has_synced(&self) -> bool {
+        self.synced_once
     }
 
     pub fn with<T: AsRef<str>, R, F: FnOnce(&Value) -> R>(&self, path: &[T], f: F) -> R {
@@ -721,6 +731,13 @@ impl ServiceClient {
                     serde_json::Value::from(self.saved_networks.clone()),
                 );
             }
+        }
+        if !self.synced_once {
+            self.synced_once = true;
+            // A UI that drew before this point shows a loading state; make
+            // sure it refreshes even if the sync found nothing new (e.g.
+            // service not reachable).
+            self.dirty.store(true, Ordering::Relaxed);
         }
     }
 }

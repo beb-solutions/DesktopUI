@@ -82,6 +82,7 @@ extern "C" {
     fn tray_loop(blocking: c_int) -> c_int;
     fn tray_update(tray: *const CTray);
     fn tray_exit();
+    fn tray_wake();
 }
 
 #[cfg(target_os = "macos")]
@@ -91,6 +92,7 @@ extern "C" {
     fn tray_loop(blocking: c_int) -> c_int;
     fn tray_update(tray: *const CTray);
     fn tray_exit();
+    fn tray_wake();
 }
 
 #[cfg(windows)]
@@ -99,6 +101,15 @@ extern "C" {
     fn tray_loop(blocking: c_int) -> c_int;
     fn tray_update(tray: *const CTray);
     fn tray_exit();
+    fn tray_wake();
+}
+
+/// Make a blocked [Tray::poll] return soon so the caller can pick up new
+/// data. Safe to call from any thread, also before the tray exists.
+pub fn wake() {
+    unsafe {
+        tray_wake();
+    }
 }
 
 unsafe extern "C" fn tray_handler_callback(item: *const CTrayMenu) {

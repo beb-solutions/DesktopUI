@@ -195,6 +195,13 @@ struct State {
     connecting: HashMap<String, (String, i64)>,
     /// Whether the service answered the last sync; drives the empty-list hint.
     online: bool,
+    /// Whether the client has completed its first sync. Until then the list
+    /// stays empty and shows "Loading…", so joined networks do not briefly
+    /// show up as saved/not connected.
+    loaded: bool,
+    /// Last mouse position over the area, None once the mouse left it. Used
+    /// to recompute `hover` when the rows change under a resting mouse.
+    mouse: Option<(f64, f64)>,
     /// Vertical layout of the list (section headers and rows), rebuilt with
     /// the rows and shared by drawing and hit testing.
     lines: Vec<Line>,
@@ -574,6 +581,8 @@ fn compute_rows(
 fn update_area(state: &mut State) {
     state.lines = layout_lines(&state.rows);
     state.text_cache = None;
+    // The row under the mouse may be a different one now.
+    state.hover = state.mouse.and_then(|(x, y)| hit_test(state, x, y));
     let h = state
         .lines
         .last()
@@ -1002,7 +1011,9 @@ unsafe extern "C" fn area_draw(
     );
 
     if state.rows.is_empty() {
-        let hint = if !state.search.is_empty() {
+        let hint = if !state.loaded {
+            "Loading…"
+        } else if !state.search.is_empty() {
             "No networks match your search"
         } else if !state.online {
             "Waiting for ZeroTier system service..."
@@ -1088,6 +1099,7 @@ unsafe extern "C" fn area_mouse(
     let state = &mut *G_STATE;
     let me = &*me;
 
+    state.mouse = Some((me.X, me.Y));
     let hit = hit_test(state, me.X, me.Y);
     if me.Down == 0 {
         if hit != state.hover {
@@ -1140,6 +1152,8 @@ unsafe extern "C" fn area_mouse(
         });
     }
     state.rebuild_needed = true;
+    // Apply right away if the client is free; otherwise the timer retries.
+    flush(state);
 }
 
 unsafe extern "C" fn area_mouse_crossed(
@@ -1148,9 +1162,12 @@ unsafe extern "C" fn area_mouse_crossed(
     left: c_int,
 ) {
     let state = &mut *G_STATE;
-    if left != 0 && state.hover.is_some() {
-        state.hover = None;
-        libui::uiAreaQueueRedrawAll(area);
+    if left != 0 {
+        state.mouse = None;
+        if state.hover.is_some() {
+            state.hover = None;
+            libui::uiAreaQueueRedrawAll(area);
+        }
     }
 }
 
@@ -1203,12 +1220,17 @@ fn try_rebuild(state: &mut State) -> bool {
     };
     prune_connecting(&guard, &mut state.connecting);
     state.online = guard.is_online();
-    let rows = compute_rows(
-        &guard,
-        &state.search,
-        state.sort_by_name,
-        &state.connecting,
-    );
+    state.loaded = guard.has_synced();
+    let rows = if state.loaded {
+        compute_rows(
+            &guard,
+            &state.search,
+            state.sort_by_name,
+            &state.connecting,
+        )
+    } else {
+        Vec::new()
+    };
     drop(guard);
     state.rows = rows;
     state.rebuild_needed = false;
@@ -1225,12 +1247,14 @@ unsafe extern "C" fn on_search_changed(e: *mut libui::uiEntry, data: *mut c_void
         CStr::from_ptr(text.cast()).to_string_lossy().to_string()
     };
     state.rebuild_needed = true;
+    flush(state);
 }
 
 unsafe extern "C" fn on_sort_changed(c: *mut libui::uiCombobox, data: *mut c_void) {
     let state = &mut *(data as *mut State);
     state.sort_by_name = libui::uiComboboxSelected(c) == 1;
     state.rebuild_needed = true;
+    flush(state);
 }
 
 /// Keep the drawn content width matched to the actual viewport so the
@@ -1263,6 +1287,14 @@ unsafe extern "C" fn on_timer(data: *mut c_void) -> c_int {
         libui::uiAreaQueueRedrawAll(state.area);
     }
 
+    flush(state);
+    1
+}
+
+/// Apply queued row actions and rebuild the list if anything changed, but
+/// only if the service client lock is free right now. Otherwise
+/// `rebuild_needed` stays set and the timer (or the next data change) retries.
+fn flush(state: &mut State) {
     // Apply queued row actions as soon as the service client lock is free.
     if !state.pending.is_empty() {
         if let Some(mut guard) = state.client.try_lock() {
@@ -1288,15 +1320,83 @@ unsafe extern "C" fn on_timer(data: *mut c_void) -> c_int {
     }
 
     // Repaint whenever new data arrived or a queued action/control change
-    // needs it, without ever blocking the UI thread on the client lock.
-    if state.rebuild_needed || state.dirty_flag.load(AtomicOrdering::Relaxed) {
-        if try_rebuild(state) {
-            state.dirty_flag.store(false, AtomicOrdering::Relaxed);
-        } else {
-            state.rebuild_needed = true;
-        }
+    // needs it, without ever blocking the UI thread on the client lock. The
+    // flag is cleared before reading the data so a change that lands in
+    // between is not lost.
+    let dirty = state.dirty_flag.swap(false, AtomicOrdering::Relaxed);
+    if (state.rebuild_needed || dirty) && !try_rebuild(state) {
+        state.rebuild_needed = true;
     }
-    1
+}
+
+/// Queued on the UI thread by the client thread when new data arrived.
+unsafe extern "C" fn on_data_changed(_: *mut c_void) {
+    let state = G_STATE;
+    if !state.is_null() {
+        flush(&mut *state);
+    }
+}
+
+/// Queued on the UI thread when the tray asks to show this window again.
+unsafe extern "C" fn on_raise(_: *mut c_void) {
+    let window = G_WINDOW;
+    if !window.is_null() {
+        raise_window(window);
+    }
+}
+
+/// Bring the window to the front, restoring it if minimized. Not
+/// uiControlShow: on macOS that re-centers the window.
+#[cfg(target_os = "macos")]
+unsafe fn raise_window(window: *mut libui::uiWindow) {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    let handle = libui::uiControlHandle(window.cast());
+    if handle == 0 {
+        return;
+    }
+    let win = handle as *mut AnyObject;
+    let nil: *mut AnyObject = null_mut();
+    let _: () = msg_send![win, deminiaturize: nil];
+    let _: () = msg_send![win, makeKeyAndOrderFront: nil];
+    let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+    let _: () = msg_send![app, activateIgnoringOtherApps: true];
+}
+
+#[cfg(windows)]
+unsafe fn raise_window(window: *mut libui::uiWindow) {
+    use winapi::shared::windef::HWND;
+    use winapi::um::winuser::{IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE};
+    let hwnd = libui::uiControlHandle(window.cast()) as HWND;
+    if hwnd.is_null() {
+        return;
+    }
+    if IsIconic(hwnd) != 0 {
+        ShowWindow(hwnd, SW_RESTORE);
+    }
+    SetForegroundWindow(hwnd);
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+unsafe fn raise_window(window: *mut libui::uiWindow) {
+    libui::uiControlShow(window.cast());
+}
+
+/// Read "raise" requests from the tray, one per line on stdin. On EOF or an
+/// error (stdin may be a terminal or /dev/null when started by hand) only this
+/// thread ends; the window stays open.
+fn start_raise_listener() {
+    std::thread::spawn(|| {
+        use std::io::BufRead;
+        for line in std::io::stdin().lock().lines() {
+            if line.is_err() {
+                break;
+            }
+            unsafe {
+                libui::uiQueueMain(Some(on_raise), null_mut());
+            }
+        }
+    });
 }
 
 unsafe extern "C" fn on_content_size_changed(w: *mut libui::uiWindow, data: *mut c_void) {
@@ -1367,7 +1467,17 @@ pub fn networks_main() {
         libui::uiBoxAppend(toolbar, sort_combo.cast(), 0);
         libui::uiBoxAppend(vbox, toolbar.cast(), 0);
 
-        let (client, dirty_flag) = crate::start_client_async(vec!["status", "network"], 250, 4);
+        // Show new data right away instead of waiting for the next timer tick.
+        let (client, dirty_flag) = crate::start_client(
+            vec!["status", "network"],
+            250,
+            4,
+            false,
+            // Already inside this function's unsafe block.
+            Some(Box::new(|| {
+                libui::uiQueueMain(Some(on_data_changed), null_mut());
+            })),
+        );
 
         // Initialize drawing handler before creating the area. The handler is
         // leaked (Box::into_raw) so its address stays valid for the app lifetime.
@@ -1392,9 +1502,12 @@ pub fn networks_main() {
         libui::uiWindowSetChild(main_window, vbox.cast());
 
         // Restore content size and window position. Without a saved position
-        // the window keeps libui's default placement.
+        // the window keeps libui's default placement. The position is set
+        // before the window is shown so it does not visibly jump; on macOS it
+        // is set again afterwards, because showing a window centers it there.
         libui::uiWindowSetContentSize(main_window, geom_w, geom_h);
-        if let Some((x, y)) = geom.and_then(|g| g.position) {
+        let position = geom.and_then(|g| g.position);
+        if let Some((x, y)) = position {
             window_restore_position(main_window, x, y);
         }
 
@@ -1411,6 +1524,8 @@ pub fn networks_main() {
             rebuild_needed: true,
             connecting: HashMap::new(),
             online: false,
+            loaded: false,
+            mouse: None,
             lines: Vec::new(),
             hover: None,
             copied: None,
@@ -1433,6 +1548,13 @@ pub fn networks_main() {
         }
 
         libui::uiControlShow(main_window.cast());
+        #[cfg(target_os = "macos")]
+        if let Some((x, y)) = position {
+            window_restore_position(main_window, x, y);
+        }
+
+        start_raise_listener();
+
         libui::uiMain();
 
         libui::uiUninit();
