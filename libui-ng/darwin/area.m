@@ -87,6 +87,13 @@ struct uiArea {
 	return YES;
 }
 
+// Deliver the click that activates an inactive window instead of
+// swallowing it, so drawn buttons react to the first click.
+- (BOOL)acceptsFirstMouse:(NSEvent *)e
+{
+	return YES;
+}
+
 - (uiModifiers)parseModifiers:(NSEvent *)e
 {
 	NSEventModifierFlags mods;

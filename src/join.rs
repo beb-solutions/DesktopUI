@@ -135,7 +135,7 @@ pub fn join_main() {
 
         libui::uiTimer(250, Some(on_timer), null_mut());
 
-        libui::uiControlShow(main_window.cast());
+        crate::show_window_when_ready(main_window, None);
         libui::uiMain();
 
         libui::uiUninit();

@@ -175,6 +175,40 @@ fn set_thread_to_foreground_priority() {
 #[cfg(not(target_os = "macos"))]
 fn set_thread_to_foreground_priority() {}
 
+/// Show a window of a child process (about, join, networks) and bring it to
+/// the front, then call `after_show`.
+///
+/// On macOS this is deferred until uiMain() runs: libui's show activates the
+/// app, and activating before [NSApp run] has called finishLaunching often
+/// leaves the app half active, so the window shows up inactive and its
+/// content ignores clicks and keys while the title bar buttons still work.
+/// Call right before uiMain().
+pub unsafe fn show_window_when_ready(window: *mut libui::uiWindow, after_show: Option<fn()>) {
+    #[cfg(target_os = "macos")]
+    {
+        struct Pending {
+            window: *mut libui::uiWindow,
+            after_show: Option<fn()>,
+        }
+        unsafe extern "C" fn show(data: *mut std::ffi::c_void) {
+            let p = Box::from_raw(data as *mut Pending);
+            libui::uiControlShow(p.window.cast());
+            if let Some(f) = p.after_show {
+                f();
+            }
+        }
+        let p = Box::into_raw(Box::new(Pending { window, after_show }));
+        libui::uiQueueMain(Some(show), p.cast());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        libui::uiControlShow(window.cast());
+        if let Some(f) = after_show {
+            f();
+        }
+    }
+}
+
 /// Quick and dirty recursive parser for decoded plist files from the old GUI on Mac... this is just for transition.
 #[cfg(target_os = "macos")]
 fn parse_mac_network_plist(

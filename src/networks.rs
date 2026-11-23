@@ -1416,6 +1416,19 @@ unsafe extern "C" fn on_content_size_changed(w: *mut libui::uiWindow, data: *mut
     }
 }
 
+/// Saved window position to apply once the window is shown.
+static mut SHOW_POSITION: Option<(f64, f64)> = None;
+
+fn after_show() {
+    unsafe {
+        if let Some((x, y)) = SHOW_POSITION {
+            if cfg!(target_os = "macos") && !G_WINDOW.is_null() {
+                window_restore_position(G_WINDOW, x, y);
+            }
+        }
+    }
+}
+
 unsafe extern "C" fn on_should_quit(_: *mut c_void) -> c_int {
     if !G_WINDOW.is_null() {
         save_geometry(G_WINDOW);
@@ -1547,11 +1560,10 @@ pub fn networks_main() {
             (*state_ptr).rebuild_needed = true;
         }
 
-        libui::uiControlShow(main_window.cast());
-        #[cfg(target_os = "macos")]
-        if let Some((x, y)) = position {
-            window_restore_position(main_window, x, y);
-        }
+        // On macOS showing a window centers it, so the position is restored
+        // again right after.
+        SHOW_POSITION = position;
+        crate::show_window_when_ready(main_window, Some(after_show));
 
         start_raise_listener();
 

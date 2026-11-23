@@ -68,7 +68,7 @@ This UI application contains the following additional open source software:
 
         libui::uiWindowSetChild(main_window, vbox.cast());
 
-        libui::uiControlShow(main_window.cast());
+        crate::show_window_when_ready(main_window, None);
         libui::uiMain();
 
         libui::uiUninit();
